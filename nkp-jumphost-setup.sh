@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # NKP 2.18 management cluster setup for a Linux jump host (Nutanix AHV, non-air-gapped).
 #
-# Phase 1 installs prerequisites: cgroups v2 check, Docker 27.4.0, kubectl 1.35.x, and the
-#         nkp CLI from the package you downloaded from the Nutanix Portal.
-# Phase 2 asks for the Prism Central details interactively, validates them, runs the NKP
+# Phase 1 installs prerequisites: cgroups v2 check, base tools including tmux, Docker 27.4.0,
+#         kubectl 1.35.x, and the nkp CLI from the package you downloaded from the Nutanix Portal.
+# Phase 2 relaunches itself inside a tmux session named "nkp" (if you are not already in one),
+#         asks for the Prism Central details interactively, validates them, runs the NKP
 #         preflight checks, then runs `nkp create cluster nutanix --self-managed`.
 #
 # Usage:
@@ -264,9 +265,9 @@ ensure_cgroup_v2() {
 
 install_base_packages() {
   local -A deb=( [curl]=curl [jq]=jq [openssl]=openssl [python3]=python3 [tar]=tar [gzip]=gzip
-                 [ping]=iputils-ping [ssh-keygen]=openssh-client [sha256sum]=coreutils [gpg]=gnupg )
+                 [ping]=iputils-ping [ssh-keygen]=openssh-client [sha256sum]=coreutils [gpg]=gnupg [tmux]=tmux )
   local -A rpm=( [curl]=curl [jq]=jq [openssl]=openssl [python3]=python3 [tar]=tar [gzip]=gzip
-                 [ping]=iputils [ssh-keygen]=openssh-clients [sha256sum]=coreutils )
+                 [ping]=iputils [ssh-keygen]=openssh-clients [sha256sum]=coreutils [tmux]=tmux )
   local cmd pkgs=()
   if [[ $OS_FAMILY == debian ]]; then
     for cmd in "${!deb[@]}"; do command -v "$cmd" >/dev/null || pkgs+=("${deb[$cmd]}"); done
@@ -277,7 +278,7 @@ install_base_packages() {
     for cmd in "${!rpm[@]}"; do command -v "$cmd" >/dev/null || pkgs+=("${rpm[$cmd]}"); done
     if ((${#pkgs[@]})); then "${SUDO[@]}" dnf -y -q install "${pkgs[@]}"; fi
   fi
-  ok "Base tools present (curl, jq, openssl, python3, ssh-keygen)"
+  ok "Base tools present (curl, jq, openssl, python3, ssh-keygen, tmux)"
 }
 
 docker_installed_version() {
@@ -445,6 +446,31 @@ ensure_docker_access() {
     exec sg docker -c "NKP_SG_REEXEC=1 $(printf '%q ' bash "$SCRIPT_PATH" --skip-prereqs "${ORIG_ARGS[@]}")"
   fi
   die "Cannot talk to Docker as ${USER}. Log out and back in (docker group), then rerun with --skip-prereqs."
+}
+
+TMUX_SESSION=nkp
+
+ensure_tmux_session() {
+  if [[ -n ${TMUX:-} || -n ${STY:-} ]]; then ok "Running inside tmux/screen"; return; fi
+  warn "Not inside tmux or screen. Cluster creation takes 30-60 minutes and stops if this SSH session drops."
+  if ! command -v tmux >/dev/null; then
+    ask_yn "tmux is not installed. Continue without it?" N \
+      || die "Install tmux (rerun without --skip-prereqs, or: dnf/apt install tmux) and try again."
+    return
+  fi
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    info "A tmux session named '${TMUX_SESSION}' already exists. Attach to it with: tmux attach -t ${TMUX_SESSION}"
+    ask_yn "Continue here without tmux instead?" N || exit 0
+    return
+  fi
+  if ask_yn "Relaunch the setup inside a tmux session named '${TMUX_SESSION}'? (recommended)" Y; then
+    info "If your connection drops, reconnect and run: tmux attach -t ${TMUX_SESSION}"
+    sleep 2
+    # The trailing shell keeps the session open so the final output stays on screen.
+    exec tmux new-session -s "$TMUX_SESSION" \
+      "$(printf '%q ' bash "$SCRIPT_PATH" --skip-prereqs "${ORIG_ARGS[@]}"); exec bash -l"
+  fi
+  ask_yn "Continue here without tmux?" N || exit 0
 }
 
 cfg_escape() { local s=${1//\\/\\\\}; printf '%s' "${s//\"/\\\"}"; }
@@ -907,10 +933,7 @@ phase_setup() {
   step "Phase 2: interactive cluster setup"
   command -v nkp >/dev/null || die "nkp CLI not found. Run without --skip-prereqs first."
   ensure_docker_access
-  if [[ -z ${TMUX:-} && -z ${STY:-} ]]; then
-    warn "Not inside tmux or screen. Cluster creation takes 30-60 minutes and stops if this SSH session drops."
-    ask_yn "Continue here anyway?" Y || exit 0
-  fi
+  ensure_tmux_session
   PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NODE_CIDR="" NODE_POOLS=""
   load_answers
   q_cluster
