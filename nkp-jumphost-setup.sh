@@ -7,11 +7,12 @@
 #         preflight checks, then runs `nkp create cluster nutanix --self-managed`.
 #
 # Usage:
-#   ./nkp-jumphost-setup.sh [--package nkp_v2.18.x_linux_amd64.tar.gz] [options]
+#   ./nkp-jumphost-setup.sh [--package nkp-bundle_v2.18.x_linux_amd64.tar.gz] [options]
 #
 # Options:
-#   --package PATH    NKP CLI package or air-gapped bundle (.tar.gz). Auto-detected in
-#                     the current directory, $HOME and $HOME/Downloads when omitted.
+#   --package PATH    NKP package from the Nutanix Portal (nkp_*, nkp-bundle_* or
+#                     nkp-air-gapped-bundle_*.tar.gz). Auto-detected in the current
+#                     directory, $HOME and $HOME/Downloads when omitted.
 #   --workdir DIR     Where answers, logs and the kubeconfig are kept (default: $HOME/nkp).
 #   --prereqs-only    Run phase 1 only.
 #   --skip-prereqs    Run phase 2 only.
@@ -387,7 +388,7 @@ find_package() {
   for dir in "$PWD" "$HOME" "$HOME/Downloads"; do
     [[ -d $dir ]] || continue
     while IFS= read -r -d '' f; do candidates+=("$f"); done \
-      < <(find "$dir" -maxdepth 1 -type f \( -name 'nkp_*linux_amd64.tar.gz' -o -name 'nkp-air-gapped-bundle_*linux_amd64.tar.gz' \) -print0 2>/dev/null)
+      < <(find "$dir" -maxdepth 1 -type f -name 'nkp[_-]*linux_amd64.tar.gz' -print0 2>/dev/null)
   done
   mapfile -t candidates < <(printf '%s\n' "${candidates[@]}" | awk 'NF && !seen[$0]++')
   case ${#candidates[@]} in
@@ -404,10 +405,10 @@ install_nkp() {
     if command -v nkp >/dev/null; then
       warn "No NKP package found; using the nkp already on PATH."
     else
-      die "No NKP package found. Download nkp_<version>_linux_amd64.tar.gz from the Nutanix Portal and pass --package PATH."
+      die "No NKP package found. Download the NKP package from the Nutanix Portal and pass --package PATH."
     fi
   else
-    [[ -r $PACKAGE ]] || die "Cannot read ${PACKAGE}"
+    [[ -r $PACKAGE ]] || die "Cannot read ${PACKAGE}. Check the exact file name with: ls $(dirname "$PACKAGE")/nkp*.tar.gz"
     dest="${HOME}/nkp-dist/$(basename "$PACKAGE" .tar.gz)"
     info "Extracting $(basename "$PACKAGE") to ${dest} ..."
     mkdir -p "$dest"
