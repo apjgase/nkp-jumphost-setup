@@ -284,8 +284,13 @@ docker_installed_version() {
   docker --version 2>/dev/null | sed -nE 's/^Docker version ([0-9.]+).*/\1/p'
 }
 
+rpm_repo_version() { # package -> epoch:version-release matching DOCKER_VERSION, e.g. 1:27.4.0-1.el9
+  dnf -q list --showduplicates "$1" 2>/dev/null \
+    | awk -v v="$DOCKER_VERSION" '$2 ~ ("(^|:)" v "-") {print $2}' | tail -1
+}
+
 install_docker() {
-  local cur pkgver
+  local cur pkgver clipkgver
   cur=$(docker_installed_version)
   if [[ $cur == "$DOCKER_VERSION" ]]; then
     ok "Docker ${cur} already installed"
@@ -320,14 +325,16 @@ install_docker() {
       if [[ $OS_ID == rhel ]]; then repo_os=rhel; fi
       "${SUDO[@]}" dnf -y -q install dnf-plugins-core
       "${SUDO[@]}" dnf config-manager --add-repo "https://download.docker.com/linux/${repo_os}/docker-ce.repo"
-      pkgver=$(dnf -q list --showduplicates docker-ce 2>/dev/null | awk -v v="$DOCKER_VERSION" '$2 ~ (":" v "-") {print $2}' | tail -1)
-      [[ -n $pkgver ]] || die "Docker ${DOCKER_VERSION} is not available in the Docker ${repo_os} repo."
+      # docker-ce and docker-ce-cli use different RPM epochs, so resolve each one separately.
+      pkgver=$(rpm_repo_version docker-ce)
+      clipkgver=$(rpm_repo_version docker-ce-cli)
+      [[ -n $pkgver && -n $clipkgver ]] || die "Docker ${DOCKER_VERSION} is not available in the Docker ${repo_os} repo."
       "${SUDO[@]}" dnf -y -q remove podman-docker docker docker-client docker-common docker-latest docker-engine >/dev/null 2>&1 || true
       if [[ -n $cur ]]; then
         "${SUDO[@]}" dnf versionlock delete docker-ce docker-ce-cli >/dev/null 2>&1 || true
         "${SUDO[@]}" dnf -y -q remove docker-ce docker-ce-cli
       fi
-      "${SUDO[@]}" dnf -y -q install --allowerasing "docker-ce-${pkgver}" "docker-ce-cli-${pkgver}" containerd.io docker-buildx-plugin
+      "${SUDO[@]}" dnf -y -q install --allowerasing "docker-ce-${pkgver}" "docker-ce-cli-${clipkgver}" containerd.io docker-buildx-plugin
       if "${SUDO[@]}" dnf -y -q install python3-dnf-plugin-versionlock >/dev/null 2>&1; then
         "${SUDO[@]}" dnf versionlock add docker-ce docker-ce-cli >/dev/null 2>&1 || true
       fi
