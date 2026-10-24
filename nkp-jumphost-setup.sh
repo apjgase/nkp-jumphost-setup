@@ -18,6 +18,7 @@
 #   --prereqs-only    Run phase 1 only.
 #   --skip-prereqs    Run phase 2 only.
 #   --print-only      Do everything except the final cluster creation; print the command.
+#   --insecure        Do not verify Prism Central's TLS certificate, without asking.
 #   -h, --help        Show this help.
 #
 # Passwords are not saved in the answers file; to skip their prompts, export NUTANIX_PASSWORD,
@@ -44,6 +45,7 @@ WORKDIR="${HOME}/nkp"
 DO_PREREQS=1
 DO_SETUP=1
 PRINT_ONLY=0
+FORCE_INSECURE=0
 
 if [[ -t 1 ]]; then
   C_B=$'\e[1m' C_G=$'\e[32m' C_Y=$'\e[33m' C_R=$'\e[31m' C_C=$'\e[36m' C_0=$'\e[0m'
@@ -71,6 +73,7 @@ parse_args() {
       --prereqs-only) DO_SETUP=0 ;;
       --skip-prereqs) DO_PREREQS=0 ;;
       --print-only)   PRINT_ONLY=1 ;;
+      --insecure)     FORCE_INSECURE=1 ;;
       -h|--help)      usage; exit 0 ;;
       *)              die "Unknown option: $1 (see --help)" ;;
     esac
@@ -528,39 +531,93 @@ q_cluster() {
   mkdir -p "$CLUSTER_DIR" && chmod 700 "$CLUSTER_DIR"
 }
 
+use_insecure() {
+  TLS_MODE=insecure PC_TLS_ARGS=(-k) TRUST_ARGS=(--insecure=true)
+  warn "NKP will not verify Prism Central's TLS certificate (--insecure)."
+}
+
+fetch_server_cert() { # out_pem -> Prism Central's own (leaf) certificate
+  local hostport=${NUTANIX_ENDPOINT#*://} sni=()
+  if [[ ! $PC_HOST =~ ^[0-9.]+$ ]]; then sni=(-servername "$PC_HOST"); fi
+  openssl s_client "${sni[@]}" -connect "$hostport" </dev/null 2>/dev/null | openssl x509 -outform PEM >"$1"
+}
+
+cert_covers_host() { # pem host -> 0 issued for host, 1 not issued for host, 2 cannot tell; prints the certificate's names
+  local rc=0
+  python3 - "$1" "$2" 2>/dev/null <<'PY' || rc=$?
+import ipaddress, ssl, sys
+try:
+    sans = ssl._ssl._test_decode_cert(sys.argv[1]).get("subjectAltName", ())
+except Exception:
+    sys.exit(2)
+print(", ".join(f"{k}:{v}" for k, v in sans))
+host = sys.argv[2].lower()
+try:
+    ip = ipaddress.ip_address(host)
+except ValueError:
+    ip = None
+for kind, value in sans:
+    value = value.strip().lower()
+    if ip is not None and kind == "IP Address":
+        try:
+            if ipaddress.ip_address(value) == ip:
+                sys.exit(0)
+        except ValueError:
+            pass
+    elif ip is None and kind == "DNS":
+        if value == host or (value.startswith("*.") and host.partition(".")[2] == value[2:]):
+            sys.exit(0)
+sys.exit(1)
+PY
+  return "$rc"
+}
+
 setup_trust() {
-  local rc=0 pem tb_help b64file
+  local rc=0 pem tb_help b64file leaf names
   PC_TLS_ARGS=()
+  if ((FORCE_INSECURE)); then
+    curl -sk -o /dev/null --max-time 10 "${NUTANIX_ENDPOINT}/" || rc=$?
+    ((rc == 0)) || die "Cannot reach ${NUTANIX_ENDPOINT} (curl exit ${rc}). Check routing, firewall and DNS from the jump host."
+    use_insecure; return
+  fi
   curl -s -o /dev/null --max-time 10 "${NUTANIX_ENDPOINT}/" || rc=$?
   case $rc in
     0) TLS_MODE=trusted; ok "Prism Central certificate is trusted by this host"; return ;;
     6|7|28) die "Cannot reach ${NUTANIX_ENDPOINT} (curl exit ${rc}). Check routing, firewall and DNS from the jump host." ;;
   esac
   warn "Prism Central's certificate is not trusted by this host (typical for the default self-signed certificate)."
-  local modes=(fetched cafile insecure)
-  local labels=("Fetch Prism Central's certificate and trust it (self-signed certificate)"
-                "Use a CA certificate file I provide (certificate issued by an internal CA)"
-                "Skip certificate verification (--insecure; labs only)")
+  local modes=(insecure fetched cafile)
+  local labels=("Skip certificate verification (--insecure; simplest for labs and POCs)"
+                "Fetch Prism Central's certificate and trust it (it must contain ${PC_HOST})"
+                "Use a CA certificate file I provide (certificate issued by an internal CA)")
   if [[ $TLS_MODE == trusted ]]; then TLS_MODE=""; fi
-  TLS_MODE=${TLS_MODE:-fetched}
+  TLS_MODE=${TLS_MODE:-insecure}
   pick TLS_MODE "How should NKP trust Prism Central" modes labels
   pem="${CLUSTER_DIR}/prism-central-ca.pem"
   case $TLS_MODE in
     insecure)
-      PC_TLS_ARGS=(-k); TRUST_ARGS=(--insecure=true); return ;;
+      use_insecure; return ;;
     fetched)
-      local hostport=${NUTANIX_ENDPOINT#*://}
-      openssl s_client -showcerts -connect "$hostport" </dev/null 2>/dev/null | openssl x509 -outform PEM >"$pem" \
-        || die "Could not fetch the certificate from ${hostport}."
+      fetch_server_cert "$pem" || die "Could not fetch the certificate from ${NUTANIX_ENDPOINT}."
       openssl x509 -in "$pem" -noout -subject -issuer -enddate -fingerprint -sha256 | sed 's/^/      /' >&2
       ask_yn "Trust this certificate?" Y || die "Certificate not trusted. Rerun and choose another option."
-      PC_TLS_ARGS=(-k) ;;
+      PC_TLS_ARGS=(-k) leaf=$pem ;;
     cafile)
       ask PC_CA_FILE "Path to the CA certificate (PEM)" v_file
       openssl x509 -in "$PC_CA_FILE" -noout >/dev/null 2>&1 || die "${PC_CA_FILE} is not a PEM certificate."
       cp "$PC_CA_FILE" "$pem"
-      PC_TLS_ARGS=(--cacert "$pem") ;;
+      PC_TLS_ARGS=(--cacert "$pem") leaf="${CLUSTER_DIR}/prism-central-server.pem"
+      fetch_server_cert "$leaf" || leaf="" ;;
   esac
+  # Trusting the issuer is not enough: NKP also requires the certificate to name the address it connects to.
+  rc=0
+  if [[ -n $leaf ]]; then names=$(cert_covers_host "$leaf" "$PC_HOST") || rc=$?; fi
+  if ((rc == 1)); then
+    warn "The certificate is not issued for ${PC_HOST} (names in it: ${names:-none}); NKP will reject it even when trusted."
+    info "To verify it, rerun using one of those names as the Prism Central address, or reissue the certificate for ${PC_HOST}."
+    if ask_yn "Skip certificate verification (--insecure) instead?" Y; then use_insecure; return; fi
+    die "Prism Central's certificate does not cover ${PC_HOST}. Rerun with an address it covers, or with --insecure."
+  fi
   if (($(wc -c <"$pem") > 12000)); then
     warn "The certificate file is large; node cloud-init data is limited to 16 KB. Pass only the CA, not a bundle."
   fi
