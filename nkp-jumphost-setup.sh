@@ -37,6 +37,7 @@ KUBECTL_MINOR="1.35"
 KUBECTL_FALLBACK="v1.35.2"
 K8S_VERSION_HINT="1.35"
 DOCKERHUB_URL="https://registry-1.docker.io"
+NUTANIX_REGISTRY_DEFAULT_USER="svcregistrynkp"
 
 PACKAGE=""
 WORKDIR="${HOME}/nkp"
@@ -770,29 +771,58 @@ q_access() {
   fi
   ask SSH_PUBLIC_KEY "SSH public key file" v_file
 
-  step "Container registry"
-  info "Docker Hub limits anonymous image pulls; NKP recommends providing credentials."
-  if ask_yn "Provide Docker Hub credentials?" "${USE_DOCKERHUB:-Y}"; then
-    USE_DOCKERHUB=Y
-    ask DOCKERHUB_USERNAME "Docker Hub username"
-    ask_secret DOCKERHUB_PASSWORD "Docker Hub password or access token"
-  else
-    USE_DOCKERHUB=N
-  fi
-
   # Newer nkp builds refuse a connected --self-managed cluster without these; the 2.18 guide does not list them.
   NUTANIX_REGISTRY_ARGS=()
-  local reg_help line
-  reg_help=$(nkp create cluster nutanix --help 2>&1 | grep -E -- '--nutanix-registry-' || true)
-  if [[ -n $reg_help ]]; then
-    step "Nutanix registry"
-    info "This nkp CLI requires Nutanix registry credentials for a connected management cluster. Its --help says:"
-    while IFS= read -r line; do info "  ${line#"${line%%[![:space:]]*}"}"; done <<<"$reg_help"
-    ask NUTANIX_REGISTRY_USERNAME "Nutanix registry username"
-    ask_secret NUTANIX_REGISTRY_PASSWORD "Nutanix registry password or token"
+  local create_help
+  create_help=$(nkp create cluster nutanix --help 2>&1 || true)
+  if [[ $create_help == *--nutanix-registry-username* ]]; then
+    step "Nutanix registry (required)"
+    info "NKP pulls its images with a Docker Hub service account issued on the Nutanix Portal."
+    info "Portal: NKP download page > generate an access token (the page shows: docker login --username svcregistrynkp)."
+    NUTANIX_REGISTRY_USERNAME=${NUTANIX_REGISTRY_USERNAME:-$NUTANIX_REGISTRY_DEFAULT_USER}
+    ask_registry_login NUTANIX_REGISTRY_USERNAME NUTANIX_REGISTRY_PASSWORD "Nutanix registry" "Access token from the Nutanix Portal"
     NUTANIX_REGISTRY_ARGS=(--nutanix-registry-username="$NUTANIX_REGISTRY_USERNAME"
                            --nutanix-registry-password="$NUTANIX_REGISTRY_PASSWORD")
   fi
+
+  step "Your own Docker Hub account (optional)"
+  info "Separate from the Nutanix registry token above. Only needed to lift Docker Hub pull limits for other images."
+  local def=Y
+  if ((${#NUTANIX_REGISTRY_ARGS[@]})); then def=N; fi
+  if ask_yn "Provide your own Docker Hub credentials?" "${USE_DOCKERHUB:-$def}"; then
+    USE_DOCKERHUB=Y
+    ask_registry_login DOCKERHUB_USERNAME DOCKERHUB_PASSWORD "Docker Hub" "Docker Hub password or access token"
+  else
+    USE_DOCKERHUB=N
+  fi
+}
+
+dockerhub_login_check() { # user token -> 0 accepted, 1 rejected, 2 could not check
+  local cfg out rc=0
+  cfg=$(mktemp -d)
+  out=$(printf '%s' "$2" | DOCKER_CONFIG="$cfg" docker login --username "$1" --password-stdin 2>&1) || rc=$?
+  rm -rf "$cfg"
+  ((rc == 0)) && return 0
+  if grep -qiE 'unauthorized|incorrect username or password|denied' <<<"$out"; then return 1; fi
+  warn "Could not verify the login with Docker Hub: ${out##*$'\n'}"
+  return 2
+}
+
+ask_registry_login() { # USER_VAR SECRET_VAR "Label" "Secret prompt"
+  local user_var=$1 secret_var=$2 label=$3 secret_prompt=$4 rc i
+  ask "$user_var" "${label} username"
+  for i in 1 2 3; do
+    ask_secret "$secret_var" "$secret_prompt"
+    dockerhub_login_check "${!user_var}" "${!secret_var}" && rc=0 || rc=$?
+    case $rc in
+      0) ok "${label} login accepted for ${!user_var}"; return ;;
+      2) ask_yn "Use these credentials without verification?" Y && return ;;
+      1) warn "Docker Hub rejected the ${label} login for ${!user_var}." ;;
+    esac
+    printf -v "$secret_var" '%s' ""
+    if ((i < 3)) && ask_yn "Change the username (currently ${!user_var})?" N; then ask "$user_var" "${label} username"; fi
+  done
+  die "${label} login failed three times. Check the token on the Nutanix Portal and rerun with --skip-prereqs."
 }
 
 q_extras() {
