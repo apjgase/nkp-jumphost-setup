@@ -20,8 +20,8 @@
 #   --print-only      Do everything except the final cluster creation; print the command.
 #   -h, --help        Show this help.
 #
-# Passwords are not saved in the answers file; to skip their prompts, export NUTANIX_PASSWORD
-# and DOCKERHUB_PASSWORD before running. The preflight dry-run manifest (cluster-dryrun.yaml,
+# Passwords are not saved in the answers file; to skip their prompts, export NUTANIX_PASSWORD,
+# DOCKERHUB_PASSWORD and NUTANIX_REGISTRY_PASSWORD before running. The preflight dry-run manifest (cluster-dryrun.yaml,
 # mode 600) does contain the credentials, because nkp renders them into Kubernetes secrets. If the jump host reaches the internet through a proxy,
 # configure apt/dnf for it and export HTTP_PROXY/HTTPS_PROXY/NO_PROXY before running.
 
@@ -512,7 +512,7 @@ save_answers() {
     for k in CLUSTER_NAME NUTANIX_ENDPOINT NUTANIX_USER TLS_MODE PC_CA_FILE NUTANIX_CLUSTER SUBNET NODE_CIDR \
              VM_IMAGE STORAGE_CONTAINER_NAME CONTROLPLANE_IP SERVICE_LB_IP_RANGE POD_CIDR SERVICE_CIDR SIZING \
              CP_REPLICAS CP_VCPUS CP_MEMORY WK_REPLICAS WK_VCPUS WK_MEMORY SSH_USERNAME SSH_PUBLIC_KEY \
-             USE_DOCKERHUB DOCKERHUB_USERNAME USE_PROXY PROXY_HTTP PROXY_HTTPS PROXY_NO NTP_SERVERS ONBOARD_PC; do
+             USE_DOCKERHUB DOCKERHUB_USERNAME NUTANIX_REGISTRY_USERNAME USE_PROXY PROXY_HTTP PROXY_HTTPS PROXY_NO NTP_SERVERS ONBOARD_PC; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
   } >"$ANSWERS_FILE"
@@ -779,6 +779,20 @@ q_access() {
   else
     USE_DOCKERHUB=N
   fi
+
+  # Newer nkp builds refuse a connected --self-managed cluster without these; the 2.18 guide does not list them.
+  NUTANIX_REGISTRY_ARGS=()
+  local reg_help line
+  reg_help=$(nkp create cluster nutanix --help 2>&1 | grep -E -- '--nutanix-registry-' || true)
+  if [[ -n $reg_help ]]; then
+    step "Nutanix registry"
+    info "This nkp CLI requires Nutanix registry credentials for a connected management cluster. Its --help says:"
+    while IFS= read -r line; do info "  ${line#"${line%%[![:space:]]*}"}"; done <<<"$reg_help"
+    ask NUTANIX_REGISTRY_USERNAME "Nutanix registry username"
+    ask_secret NUTANIX_REGISTRY_PASSWORD "Nutanix registry password or token"
+    NUTANIX_REGISTRY_ARGS=(--nutanix-registry-username="$NUTANIX_REGISTRY_USERNAME"
+                           --nutanix-registry-password="$NUTANIX_REGISTRY_PASSWORD")
+  fi
 }
 
 q_extras() {
@@ -822,7 +836,8 @@ build_command() {
     --ssh-username="$SSH_USERNAME"
     --ssh-public-key-file="$SSH_PUBLIC_KEY"
     --timeout=60m
-    "${SIZING_ARGS[@]}")
+    "${SIZING_ARGS[@]}"
+    "${NUTANIX_REGISTRY_ARGS[@]}")
   if [[ $USE_DOCKERHUB == Y ]]; then
     CMD+=(--registry-url="$DOCKERHUB_URL" --registry-username="$DOCKERHUB_USERNAME" --registry-password="$DOCKERHUB_PASSWORD")
   fi
@@ -838,6 +853,7 @@ redacted_command() {
   for a in "${CMD[@]}"; do
     case $a in
       --registry-password=*) out+=("--registry-password=********") ;;
+      --nutanix-registry-password=*) out+=("--nutanix-registry-password=********") ;;
       --additional-trust-bundle=*) ((${#a} > 200)) && out+=("--additional-trust-bundle=<base64 Prism Central certificate>") || out+=("$a") ;;
       *) out+=("$a") ;;
     esac
@@ -865,6 +881,7 @@ show_summary() {
   row "Sizing" "$SIZING"
   row "SSH" "$SSH_USERNAME, key $SSH_PUBLIC_KEY"
   row "Docker Hub credentials" "$hub"
+  if ((${#NUTANIX_REGISTRY_ARGS[@]})); then row "Nutanix registry user" "$NUTANIX_REGISTRY_USERNAME"; fi
   row "Proxy" "$proxy"
   row "NTP servers" "${NTP_SERVERS:-image defaults}"
   row "Prism Central onboarding" "$ONBOARD_PC"
@@ -934,7 +951,7 @@ phase_setup() {
   command -v nkp >/dev/null || die "nkp CLI not found. Run without --skip-prereqs first."
   ensure_docker_access
   ensure_tmux_session
-  PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NODE_CIDR="" NODE_POOLS=""
+  PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NUTANIX_REGISTRY_ARGS=() NODE_CIDR="" NODE_POOLS=""
   load_answers
   q_cluster
   q_prism_central
