@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# NKP 2.18 management cluster setup for a Linux jump host (Nutanix AHV, non-air-gapped).
+# NKP 2.19 lab builder for a Linux jump host (Nutanix AHV, non-air-gapped).
 #
 # Phase 1 installs prerequisites: cgroups v2 check, base tools including tmux, Docker 27.4.0,
-#         kubectl 1.35.x, and the nkp CLI from the package you downloaded from the Nutanix Portal.
+#         kubectl 1.36.x, and the nkp CLI from the package you downloaded from the Nutanix Portal.
 # Phase 2 relaunches itself inside a tmux session named "nkp" (if you are not already in one),
-#         asks for the Prism Central details interactively, validates them, runs the NKP
-#         preflight checks, then runs `nkp create cluster nutanix --self-managed`.
-# --workload then creates workload (managed) clusters from that management cluster: it reuses the
-#         management answers as defaults, picks or creates a workspace, checks that the control plane IP
-#         and load balancer range are not used by another NKP cluster, and waits until the cluster
-#         has joined the workspace and its platform applications are ready.
+#         asks for the Prism Central details, reserves IP addresses at the end of the node subnet's
+#         IPAM pool and points the subnet's DHCP at the lab DNS server (VM "autoad"), validates
+#         everything, runs the NKP preflight checks, then runs `nkp create cluster nutanix --self-managed`.
+# --workload then creates a workload (managed) cluster from that management cluster: it reuses the
+#         management answers and the reserved addresses as defaults, picks or creates a workspace, and
+#         waits until the cluster has joined the workspace and its platform applications are ready.
+# --lab   does all of it in one go: every question up front, then the management cluster and the first
+#         workload cluster unattended, ending with lab-summary.txt.
 #
 # Usage:
-#   ./nkp-jumphost-setup.sh [--package nkp-bundle_v2.18.x_linux_amd64.tar.gz] [options]
+#   ./nkp-jumphost-setup.sh --lab [--config nkp-lab.env]
+#   ./nkp-jumphost-setup.sh [--package nkp-bundle_v2.19.x_linux_amd64.tar.gz] [options]
 #   ./nkp-jumphost-setup.sh --workload
+#   ./nkp-jumphost-setup.sh --destroy
 #
 # Options:
 #   --package PATH    NKP package from the Nutanix Portal (nkp_*, nkp-bundle_* or
@@ -27,6 +31,15 @@
 #   --status          Show what is still not ready on a cluster this script already created.
 #   --workload        Create a workload (managed) cluster on the management cluster this script
 #                     created: it attaches to a workspace you choose. Run after the management cluster is up.
+#   --lab             Prerequisites, management cluster and first workload cluster in one run.
+#   --config FILE     Answers file (see --init-config) used as defaults; with --unattended, as the answers.
+#   --init-config     Write a commented answers template to ./nkp-lab.env and exit.
+#   --unattended      Never prompt: take every default, stop if one is missing or invalid.
+#                     Passwords must then be exported (see below).
+#   --no-ip-plan      Do not reserve addresses from the IPAM pool or change the subnet's DHCP options.
+#   --destroy         Delete the workload cluster(s), then the management cluster, and restore the
+#                     subnet's IPAM pool and DHCP options. With --unattended, export
+#                     NKP_DESTROY_CONFIRM=<management cluster name> instead of typing it.
 #   -h, --help        Show this help.
 #
 # Passwords are not saved in the answers file; to skip their prompts, export NUTANIX_PASSWORD,
@@ -40,11 +53,11 @@ set -Eeuo pipefail
 SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 ORIG_ARGS=("$@")
 
-NKP_MINOR="2.18"
+NKP_MINOR="2.19"
 DOCKER_VERSION="27.4.0"
-KUBECTL_MINOR="1.35"
-KUBECTL_FALLBACK="v1.35.2"
-K8S_VERSION_HINT="1.35"
+KUBECTL_MINOR="1.36"
+KUBECTL_FALLBACK="v1.36.2"
+K8S_VERSION_HINT="1.36"
 DOCKERHUB_URL="https://registry-1.docker.io"
 NUTANIX_REGISTRY_DEFAULT_USER="svcregistrynkp"
 MIN_WORKERS=4  # two 4 vCPU workers (the documented Starter minimum) leave Kommander apps Pending on CPU
@@ -57,6 +70,14 @@ PRINT_ONLY=0
 FORCE_INSECURE=0
 STATUS_ONLY=0
 WORKLOAD=0
+LAB=0
+UNATTENDED=0
+CONFIG_FILE=""
+INIT_CONFIG=0
+NO_IP_PLAN=0
+DESTROY=0
+LAB_DNS_VM=autoad
+LAB_DOMAIN=ntnxlab.local
 WORKSPACE_NAMESPACE=""
 RESERVED_RANGES=""
 MGMT_CLUSTER_NAME=""
@@ -92,12 +113,108 @@ parse_args() {
       --insecure)     FORCE_INSECURE=1 ;;
       --status)       STATUS_ONLY=1 ;;
       --workload)     WORKLOAD=1 TMUX_SESSION=nkp-workload ;;
+      --lab)          LAB=1 ;;
+      --config)       CONFIG_FILE=${2:?--config needs a file}; shift ;;
+      --init-config)  INIT_CONFIG=1 ;;
+      --unattended)   UNATTENDED=1 ;;
+      --no-ip-plan)   NO_IP_PLAN=1 ;;
+      --destroy)      DESTROY=1 ;;
       -h|--help)      usage; exit 0 ;;
       *)              die "Unknown option: $1 (see --help)" ;;
     esac
     shift
   done
   [[ -z $PACKAGE ]] || PACKAGE=$(readlink -f "$PACKAGE")
+  if [[ -n $CONFIG_FILE ]]; then
+    [[ -r $CONFIG_FILE ]] || die "Cannot read the config file ${CONFIG_FILE}."
+    CONFIG_FILE=$(readlink -f "$CONFIG_FILE")
+  fi
+}
+
+load_config() { # sources --config; it may also set LAB_DNS_VM, LAB_DOMAIN and WL_* keys
+  [[ -n $CONFIG_FILE ]] || return 1
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+  info "Defaults from ${CONFIG_FILE}"
+}
+
+# Workload values that differ from the management cluster's: KEY or KEY:WL_NAME (default WL_KEY).
+WL_MAP=(CLUSTER_NAME WORKSPACE_NAMESPACE CONTROLPLANE_IP SERVICE_LB_IP_RANGE:WL_LB_RANGE
+        SIZING CP_REPLICAS CP_VCPUS CP_MEMORY WK_REPLICAS WK_VCPUS WK_MEMORY)
+
+swap_wl() { # exchange the current values with the WL_* ones
+  local p k w t
+  for p in "${WL_MAP[@]}"; do
+    k=${p%%:*} w=WL_${p}
+    if [[ $p == *:* ]]; then w=${p#*:}; fi
+    t=${!k:-}
+    printf -v "$k" '%s' "${!w:-}"
+    printf -v "$w" '%s' "$t"
+  done
+}
+
+apply_wl() { # non-empty WL_* values override the current ones
+  local p k w
+  for p in "${WL_MAP[@]}"; do
+    k=${p%%:*} w=WL_${p}
+    if [[ $p == *:* ]]; then w=${p#*:}; fi
+    if [[ -n ${!w:-} ]]; then printf -v "$k" '%s' "${!w}"; fi
+  done
+}
+
+init_config() {
+  local f="$PWD/nkp-lab.env"
+  if [[ -e $f ]] && ! ask_yn "${f} exists. Overwrite it?" N; then exit 0; fi
+  cat >"$f" <<'EOF'
+# NKP lab answers for nkp-jumphost-setup.sh --lab --config nkp-lab.env [--unattended]
+# Blank values fall back to the script's defaults or are discovered from Prism Central.
+# Passwords are never read from this file: export NUTANIX_PASSWORD and NUTANIX_REGISTRY_PASSWORD.
+
+# Management cluster
+CLUSTER_NAME=nkp-mgmt
+NUTANIX_ENDPOINT=                 # Prism Central, e.g. https://10.42.x.39:9440
+NUTANIX_USER=admin
+TLS_MODE=insecure                 # insecure | fetched | cafile (with PC_CA_FILE)
+NUTANIX_CLUSTER=                  # Prism Element name; blank = the only one
+SUBNET=Primary
+VM_IMAGE=                         # blank = the only image whose name contains 1.36
+STORAGE_CONTAINER_NAME=default
+CONTROLPLANE_IP=                  # blank = from the IP plan
+SERVICE_LB_IP_RANGE=              # blank = from the IP plan
+POD_CIDR=192.168.0.0/16
+SERVICE_CIDR=10.96.0.0/12
+SIZING=starter                    # pro | starter | custom (then CP_* and WK_* below)
+CP_REPLICAS=
+CP_VCPUS=
+CP_MEMORY=
+WK_REPLICAS=
+WK_VCPUS=
+WK_MEMORY=
+SSH_USERNAME=nkpadmin
+SSH_PUBLIC_KEY=                   # blank = ~/.ssh/id_ed25519.pub, generated if missing
+NUTANIX_REGISTRY_USERNAME=svcregistrynkp
+USE_DOCKERHUB=N
+DOCKERHUB_USERNAME=
+USE_PROXY=N
+PROXY_HTTP=
+PROXY_HTTPS=
+PROXY_NO=
+NTP_SERVERS=                      # blank = Prism Central's NTP servers
+ONBOARD_PC=Y
+
+# Lab network: DNS server VM and domain handed out by the subnet's DHCP
+LAB_DNS_VM=autoad
+LAB_DOMAIN=ntnxlab.local
+
+# Workload cluster: WL_* keys override the management values above for the workload cluster
+WL_CLUSTER_NAME=nkp-workload1
+WL_WORKSPACE_NAMESPACE=kommander-default-workspace
+WL_SIZING=starter
+WL_CONTROLPLANE_IP=               # blank = from the IP plan
+WL_LB_RANGE=                      # blank = from the IP plan
+EOF
+  chmod 600 "$f"
+  ok "Wrote ${f}. Edit it, then run: ${SCRIPT_PATH} --lab --config ${f}"
 }
 
 # ---------------------------------------------------------------------------
@@ -107,6 +224,17 @@ parse_args() {
 ask() { # VAR "Prompt" [validator]; validator "optional" allows an empty answer
   local __var=$1 __prompt=$2 __validator=${3-} __def __ans
   __def=${!__var:-}
+  if ((UNATTENDED)); then
+    if [[ -z $__def ]]; then
+      if [[ $__validator == optional ]]; then printf -v "$__var" '%s' ""; info "${__prompt}: (blank)"; return; fi
+      die "--unattended: no value for ${__var} (${__prompt}). Set it in the config file."
+    fi
+    if [[ -n $__validator && $__validator != optional ]] && ! "$__validator" "$__def"; then
+      die "--unattended: invalid ${__var}=${__def} (${__prompt})."
+    fi
+    info "${__prompt}: ${__def}"
+    return
+  fi
   while :; do
     if [[ -n $__def ]]; then
       read -r -p "    ${__prompt} [${__def}]: " __ans </dev/tty
@@ -127,6 +255,7 @@ ask() { # VAR "Prompt" [validator]; validator "optional" allows an empty answer
 ask_secret() { # VAR "Prompt"; skipped when VAR is already set in the environment
   local __var=$1 __prompt=$2 __ans
   [[ -n ${!__var:-} ]] && { info "${__prompt}: using value from \$${__var}"; return; }
+  ((UNATTENDED)) && die "--unattended: export ${__var} (${__prompt}) before running."
   while :; do
     read -r -s -p "    ${__prompt}: " __ans </dev/tty; echo >&2
     [[ -n $__ans ]] && break
@@ -138,6 +267,11 @@ ask_secret() { # VAR "Prompt"; skipped when VAR is already set in the environmen
 ask_yn() { # "Prompt" Y|N -> exit status 0 for yes
   local __prompt=$1 __def=${2:-Y} __ans __hint="[Y/n]"
   [[ $__def == N ]] && __hint="[y/N]"
+  if ((UNATTENDED)); then
+    info "${__prompt} ${__hint}: ${__def}"
+    if [[ $__def == N ]]; then return 1; fi
+    return 0
+  fi
   while :; do
     read -r -p "    ${__prompt} ${__hint}: " __ans </dev/tty
     __ans=${__ans:-$__def}
@@ -154,6 +288,23 @@ pick() { # VAR "Prompt" values_array [labels_array]
   local -n __labels=${4:-$3}
   local __cur=${!__var:-} __def="" __ans __i
   if ((${#__vals[@]} == 0)); then ask "$__var" "$__prompt"; return; fi
+  if ((${#__vals[@]} == 1)) && [[ -z $__cur || $__cur == "${__vals[0]}" ]]; then
+    printf -v "$__var" '%s' "${__vals[0]}"
+    ok "${__prompt}: ${__labels[0]} (only choice)"
+    return
+  fi
+  if ((UNATTENDED)); then
+    for __i in "${!__vals[@]}"; do
+      if [[ ${__vals[$__i]} == "$__cur" ]]; then info "${__prompt}: ${__labels[$__i]}"; return; fi
+    done
+    for __i in "${!__vals[@]}"; do
+      # Prism Central names are case-sensitive for NKP; adopt the exact spelling.
+      if [[ ${__vals[$__i],,} == "${__cur,,}" ]]; then
+        printf -v "$__var" '%s' "${__vals[$__i]}"; warn "${__prompt}: using '${__vals[$__i]}' (exact case)"; return
+      fi
+    done
+    die "--unattended: ${__var}='${__cur}' is not one of: ${__vals[*]} (${__prompt})."
+  fi
   echo "    ${__prompt}:" >&2
   for __i in "${!__vals[@]}"; do
     printf '      %2d) %s\n' $((__i + 1)) "${__labels[$__i]}" >&2
@@ -200,6 +351,8 @@ try:
         n = ipaddress.ip_network(a[1], strict=False); lo, hi = rng(a[0]); ok = lo in n and hi in n
     elif op == "ip_in_ranges":
         ip = ipaddress.ip_address(a[0]); ok = any(lo <= ip <= hi for lo, hi in rngs(a[1]))
+    elif op == "range_in_ranges":
+        lo, hi = rng(a[0]); ok = any(l <= lo and hi <= h for l, h in rngs(a[1]))
     elif op == "range_overlaps":
         lo, hi = rng(a[0]); ok = any(lo <= h and l <= hi for l, h in rngs(a[1]))
     elif op == "cidr_overlap":
@@ -241,6 +394,21 @@ v_endpoint() {
 }
 
 ip_responds() { ping -c1 -W1 "$1" >/dev/null 2>&1; }
+
+retry_guard() { # COUNTER_VAR: call at the top of a question loop; --unattended cannot re-ask, so it stops instead
+  local -n __n=$1
+  __n=$((__n + 1))
+  if ((UNATTENDED && __n > 1)); then die "--unattended: the value above was rejected. Fix it in the config file."; fi
+}
+
+default_match() { # VAR values_array regex: if VAR is empty, set it to the first value matching regex (case-insensitive)
+  local -n __dm_vals=$2
+  local __v
+  [[ -z ${!1:-} ]] || return 0
+  for __v in "${__dm_vals[@]}"; do
+    if [[ ${__v,,} =~ $3 ]]; then printf -v "$1" '%s' "$__v"; return 0; fi
+  done
+}
 
 # ---------------------------------------------------------------------------
 # Phase 1: prerequisites
@@ -329,7 +497,7 @@ install_docker() {
     ok "Docker ${cur} already installed"
   else
     if [[ -n $cur ]]; then
-      warn "Docker ${cur} is installed; the NKP 2.18 docs require ${DOCKER_VERSION}."
+      warn "Docker ${cur} is installed; the NKP ${NKP_MINOR} docs require ${DOCKER_VERSION}."
       if ! ask_yn "Replace it with Docker ${DOCKER_VERSION}? (images and containers are kept)" Y; then
         warn "Keeping Docker ${cur}."
         configure_docker
@@ -404,7 +572,7 @@ install_kubectl() {
   local cur ver tmp
   cur=$(kubectl version --client -o json 2>/dev/null | jq -r '.clientVersion.gitVersion // empty' || true)
   if [[ $cur == v${KUBECTL_MINOR}.* ]]; then ok "kubectl ${cur} already installed"; return; fi
-  [[ -n $cur ]] && warn "kubectl ${cur} found; NKP 2.18 needs ${KUBECTL_MINOR}.x. Replacing /usr/local/bin/kubectl."
+  [[ -n $cur ]] && warn "kubectl ${cur} found; NKP ${NKP_MINOR} needs ${KUBECTL_MINOR}.x. Replacing /usr/local/bin/kubectl."
   ver=$(curl -fsSL "https://dl.k8s.io/release/stable-${KUBECTL_MINOR}.txt" 2>/dev/null || echo "$KUBECTL_FALLBACK")
   tmp=$(mktemp -d)
   curl -fsSLo "${tmp}/kubectl" "https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubectl"
@@ -482,6 +650,7 @@ ensure_docker_access() {
 TMUX_SESSION=nkp
 
 ensure_tmux_session() {
+  if [[ -n ${NKP_LAB_CHILD:-} ]]; then return 0; fi
   if [[ -n ${TMUX:-} || -n ${STY:-} ]]; then ok "Running inside tmux/screen"; return; fi
   warn "Not inside tmux or screen. Cluster creation takes 30-60 minutes and stops if this SSH session drops."
   if ! command -v tmux >/dev/null; then
@@ -530,6 +699,7 @@ normalize_endpoint() {
 load_answers() {
   ANSWERS_FILE="${WORKDIR}/nkp-install.env"
   mkdir -p "$WORKDIR" && chmod 700 "$WORKDIR"
+  if load_config; then return 0; fi
   if [[ -f $ANSWERS_FILE ]] && ask_yn "Found answers from a previous run. Use them as defaults?" Y; then
     # shellcheck disable=SC1090
     . "$ANSWERS_FILE"
@@ -699,11 +869,15 @@ q_prism_central() {
 q_inventory() {
   step "Prism Central resources"
   local pe_list=() subnets_json="" subnet_vals=() subnet_labels=() img_all=() img_list=() sc_list=() line pools name label
+  CLUSTERS_JSON="" SUBNET_UUID="" PE_UUID=""
   if ((PC_API_OK)); then
-    mapfile -t pe_list < <(pc_api POST /api/nutanix/v3/clusters/list '{"kind":"cluster","length":500}' 2>/dev/null \
-      | jq -r '.entities[] | select((.status.resources.config.service_list // []) | index("PRISM_CENTRAL") | not) | .status.name' | sort || true)
+    CLUSTERS_JSON=$(pc_api POST /api/nutanix/v3/clusters/list '{"kind":"cluster","length":500}' 2>/dev/null || true)
+    mapfile -t pe_list < <(jq -r '.entities[] | select((.status.resources.config.service_list // []) | index("PRISM_CENTRAL") | not) | .status.name' \
+      <<<"$CLUSTERS_JSON" 2>/dev/null | sort || true)
   fi
   pick NUTANIX_CLUSTER "Prism Element cluster for the nodes" pe_list
+  PE_UUID=$(jq -r --arg c "$NUTANIX_CLUSTER" '[.entities[]? | select(.status.name == $c) | .metadata.uuid][0] // empty' \
+    <<<"$CLUSTERS_JSON" 2>/dev/null || true)
 
   if ((PC_API_OK)); then
     subnets_json=$(pc_api POST /api/nutanix/v3/subnets/list '{"kind":"subnet","length":500}' 2>/dev/null || true)
@@ -720,10 +894,15 @@ q_inventory() {
              + ")")]
         | @tsv' <<<"$subnets_json" 2>/dev/null || true)
   fi
+  default_match SUBNET subnet_vals '^primary$'
   pick SUBNET "Subnet for control plane and worker nodes (must have IPAM or DHCP)" subnet_vals subnet_labels
 
   NODE_POOLS=""
   if [[ -n $subnets_json ]]; then
+    SUBNET_UUID=$(jq -r --arg s "$SUBNET" --arg c "$NUTANIX_CLUSTER" '
+        [.entities[]? | select(.status.name == $s)
+         | select(((.status.cluster_reference.name // .spec.cluster_reference.name // "") as $n | $n == $c or $n == ""))][0]
+        | .metadata.uuid // empty' <<<"$subnets_json" 2>/dev/null || true)
     line=$(jq -r --arg s "$SUBNET" --arg c "$NUTANIX_CLUSTER" '
         [.entities[]? | select(.status.name == $s)
          | select(((.status.cluster_reference.name // .spec.cluster_reference.name // "") as $n | $n == $c or $n == ""))][0]
@@ -762,13 +941,285 @@ q_inventory() {
       | jq -r --arg c "$NUTANIX_CLUSTER" '.data[]? | select((.clusterName // $c) == $c) | .name
                | select(. != "NutanixManagementShare" and . != "SelfServiceContainer")' | sort -u || true)
   fi
+  default_match STORAGE_CONTAINER_NAME sc_list '^default$'
+  default_match STORAGE_CONTAINER_NAME sc_list '^default'
   pick STORAGE_CONTAINER_NAME "Storage container for Kubernetes persistent volumes (on ${NUTANIX_CLUSTER})" sc_list
 }
 
-q_network() {
-  step "Cluster IP addresses"
+# ---------------------------------------------------------------------------
+# Lab network: addresses reserved at the end of the IPAM pool, DHCP DNS from the AutoAD VM
+# ---------------------------------------------------------------------------
+
+IP_PLAN_MAX=30           # management API + workload API + two load balancer ranges of 14
+IP_PLAN_MIN=12           # never fewer: 1 + 1 + 5 + 5
+IP_PLAN_NODE_RESERVE=20  # pool addresses left for node VMs (both clusters plus rolling upgrades)
+VMS_FILE=""
+
+ip_plan_file() { printf '%s' "${WORKDIR}/nkp-ip-plan.env"; }
+
+ip_plan_get() { # KEY -> its value in the IP plan file, without touching the caller's variables
+  local f; f=$(ip_plan_file)
+  [[ -f $f ]] || return 0
+  # shellcheck disable=SC1090
+  (. "$f"; printf '%s' "${!1:-}")
+}
+
+ip_plan_default() { # VAR KEY: take the plan's value unless VAR already holds addresses inside the reserved block
+  local block val cur=${!1:-} r
+  block=$(ip_plan_get IP_PLAN_BLOCK) val=$(ip_plan_get "$2")
+  [[ -n $block && -n $val ]] || return 0
+  [[ -z ${SUBNET:-} || $(ip_plan_get IP_PLAN_SUBNET) == "$SUBNET" ]] || return 0
+  if [[ -n $cur ]]; then
+    r=$cur
+    [[ $r == *-* ]] || r="${r}-${r}"
+    if ipcalc range_in_ranges "$r" "$block"; then return 0; fi
+  fi
+  printf -v "$1" '%s' "$val"
+}
+
+load_vms() { # every VM in Prism Central (paged) as one JSON array in VMS_FILE
+  [[ -z $VMS_FILE ]] || return 0
+  local dir offset=0 total=1 n page=0
+  dir=$(mktemp -d)
+  while ((offset < total)); do
+    page=$((page + 1))
+    pc_api POST /api/nutanix/v3/vms/list "{\"kind\":\"vm\",\"length\":250,\"offset\":${offset}}" >"${dir}/${page}.json" 2>/dev/null \
+      || { rm -rf "$dir"; return 1; }
+    total=$(jq -r '.metadata.total_matches // 0' "${dir}/${page}.json")
+    n=$(jq -r '.entities | length' "${dir}/${page}.json")
+    ((n > 0)) || break
+    offset=$((offset + n))
+  done
+  VMS_FILE="${WORKDIR}/pc-vms.json"
+  jq -s '[.[].entities[]?]' "$dir"/*.json >"$VMS_FILE"
+  rm -rf "$dir"
+}
+
+used_ips() { # subnet_json -> addresses in use: VM NICs, Prism Element/Central, hosts, gateway, DHCP server
+  if [[ -n $VMS_FILE ]]; then
+    jq -r '.[] | .status.resources.nic_list[]? | .ip_endpoint_list[]? | .ip // empty' "$VMS_FILE" 2>/dev/null || true
+  fi
+  jq -r '.entities[]? | (.status.resources.network // {}), (.spec.resources.network // {})
+         | .external_ip, .external_data_services_ip | strings' <<<"$CLUSTERS_JSON" 2>/dev/null || true
+  if [[ $PC_HOST =~ ^[0-9.]+$ ]]; then printf '%s\n' "$PC_HOST"; fi
+  pc_api POST /api/nutanix/v3/hosts/list '{"kind":"host","length":500}' 2>/dev/null \
+    | jq -r '.entities[]? | .status.resources | (.hypervisor.ip, .controller_vm.ip, .ipmi.ip) | strings' 2>/dev/null || true
+  jq -r '.spec.resources.ip_config | (.default_gateway_ip, .dhcp_server_address.ip) | strings' <<<"$1" 2>/dev/null || true
+}
+
+ip_select() { # pools(a-b,...) used_file max min node_reserve -> KEY=value plan; exit 1 if no free run of min addresses
+  python3 - "$@" <<'PY'
+import ipaddress, sys
+pools_s, used_f = sys.argv[1], sys.argv[2]
+mx, mn, keep = (int(x) for x in sys.argv[3:6])
+A = ipaddress.ip_address
+pools = []
+for p in pools_s.split(","):
+    if p.strip():
+        lo, hi = (int(A(x.strip())) for x in p.split("-", 1))
+        pools.append((lo, hi))
+used = set()
+for line in open(used_f):
+    try:
+        used.add(int(A(line.strip())))
+    except ValueError:
+        pass
+runs = []  # maximal runs of free addresses inside the pools
+for lo, hi in pools:
+    start = None
+    for ip in range(lo, hi + 1):
+        if ip in used:
+            if start is not None:
+                runs.append((start, ip - 1))
+            start = None
+        elif start is None:
+            start = ip
+    if start is not None:
+        runs.append((start, hi))
+free = sum(hi - lo + 1 for lo, hi in runs)
+runs = [r for r in runs if r[1] - r[0] + 1 >= mn]
+if not runs:
+    sys.exit(1)
+lo, hi = max(runs, key=lambda r: r[1])  # the run closest to the end of the pool
+n = min(mx, hi - lo + 1, free - keep)
+if n < mn:
+    sys.exit(1)
+b = list(range(hi - n + 1, hi + 1))
+s = lambda i: str(A(i))
+half = (n - 2) // 2
+new = []
+for plo, phi in pools:
+    if plo <= b[0] and b[-1] <= phi:
+        if plo < b[0]:
+            new.append((plo, b[0] - 1))
+        if b[-1] < phi:
+            new.append((b[-1] + 1, phi))
+    else:
+        new.append((plo, phi))
+print(f"IP_PLAN_COUNT={n}")
+print(f"IP_PLAN_BLOCK={s(b[0])}-{s(b[-1])}")
+print("IP_PLAN_NEW_POOLS=" + ",".join(f"{s(x)}-{s(y)}" for x, y in new))
+print(f"MGMT_CONTROLPLANE_IP={s(b[0])}")
+print(f"WL_CONTROLPLANE_IP={s(b[1])}")
+print(f"MGMT_LB_RANGE={s(b[2])}-{s(b[1 + half])}")
+print(f"WL_LB_RANGE={s(b[2 + half])}-{s(b[1 + 2 * half])}")
+PY
+}
+
+range_responders() { # a-b -> the addresses in it that answer ping
+  python3 -c 'import ipaddress as i, sys
+lo, hi = (int(i.ip_address(x)) for x in sys.argv[1].split("-"))
+print("\n".join(str(i.ip_address(n)) for n in range(lo, hi + 1)))' "$1" \
+    | xargs -P 32 -I{} sh -c 'ping -c1 -W1 {} >/dev/null 2>&1 && echo {}' | sort -V || true
+}
+
+ranges_to_pools() { jq -nc --arg r "$1" '[$r | split(",")[] | select(length > 0) | {range: sub("-"; " ")}]'; }
+
+lab_dns_ip() { # first IPv4 of the VM named LAB_DNS_VM (exact match preferred, case-insensitive)
+  [[ -n $VMS_FILE ]] || return 0
+  jq -r --arg n "${LAB_DNS_VM,,}" '
+      [.[] | ((.status.name // .spec.name // "") | ascii_downcase) as $vm | select($vm | contains($n))
+       | {exact: ($vm == $n), ip: ([.status.resources.nic_list[]? | .ip_endpoint_list[]? | .ip // empty
+                                   | select(test("^[0-9]+([.][0-9]+){3}$"))][0])}
+       | select(.ip)] | sort_by(.exact | not) | .[0].ip // empty' "$VMS_FILE" 2>/dev/null || true
+}
+
+dns_answers() { # server name -> 0 if the server returns an address for name
+  python3 - "$1" "$2" <<'PY'
+import random, socket, struct, sys
+server, name = sys.argv[1:3]
+qid = random.randint(0, 65535)
+query = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+query += b"".join(bytes([len(p)]) + p.encode() for p in name.rstrip(".").split(".")) + b"\0"
+query += struct.pack(">HH", 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+try:
+    s.sendto(query, (server, 53))
+    data = s.recv(4096)
+except OSError:
+    sys.exit(1)
+rid, flags, _, answers = struct.unpack(">HHHH", data[:8])
+sys.exit(0 if rid == qid and flags & 0x000F == 0 and answers > 0 else 1)
+PY
+}
+
+subnet_update() { # JSON body -> PUT it to SUBNET_UUID and wait for the Prism Central task
+  local out code task status i
+  out=$(pc_curl -X PUT -H 'Content-Type: application/json' --data "$1" -w '\n%{http_code}' \
+    "${NUTANIX_ENDPOINT}/api/nutanix/v3/subnets/${SUBNET_UUID}" 2>&1) || true
+  code=${out##*$'\n'} out=${out%$'\n'*}
+  if [[ $code != 2?? ]]; then
+    err "Prism Central rejected the subnet update (HTTP ${code}): $(jq -r '[.message_list[]?.message] | join("; ")' <<<"$out" 2>/dev/null || head -c 300 <<<"$out")"
+    return 1
+  fi
+  task=$(jq -r '.status.execution_context.task_uuid // empty' <<<"$out" 2>/dev/null || true)
+  [[ -n $task ]] || return 0
+  for ((i = 0; i < 90; i++)); do
+    status=$(pc_api GET "/api/nutanix/v3/tasks/${task}" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
+    case $status in
+      SUCCEEDED)     return 0 ;;
+      FAILED|ABORTED) err "Subnet update task ${task} ${status}."; return 1 ;;
+    esac
+    sleep 2
+  done
+  err "Subnet update task ${task} did not finish within 3 minutes."
+  return 1
+}
+
+subnet_pools() { jq -r '[.spec.resources.ip_config.pool_list[]?.range | gsub(" +"; "-")] | join(",")' <<<"$1"; }
+
+lab_network() { # management run, between q_inventory and q_network
+  step "Lab network: addresses for NKP and DNS"
+  local f subnet_json pools used_file plan="" responders="" try k v dns_ip="" dhcp_new=null body now
+  local IP_PLAN_COUNT IP_PLAN_BLOCK IP_PLAN_NEW_POOLS MGMT_CONTROLPLANE_IP WL_CONTROLPLANE_IP MGMT_LB_RANGE WL_LB_RANGE
+  local IP_PLAN_SUBNET=$SUBNET IP_PLAN_SUBNET_UUID=$SUBNET_UUID IP_PLAN_ORIGINAL_POOLS IP_PLAN_ORIGINAL_DHCP IP_PLAN_DNS="" IP_PLAN_DOMAIN=""
+  f=$(ip_plan_file)
+  if ((NO_IP_PLAN)); then info "--no-ip-plan: the subnet's IPAM pool and DHCP options stay as they are."; return 0; fi
+  if ((!PC_API_OK)) || [[ -z $SUBNET_UUID ]]; then warn "Prism Central API not available; skipping the IP plan."; return 0; fi
+  if [[ -f $f && $(ip_plan_get IP_PLAN_SUBNET_UUID) == "$SUBNET_UUID" ]] \
+     && ! ipcalc range_overlaps "$(ip_plan_get IP_PLAN_BLOCK)" "$NODE_POOLS"; then
+    ok "Reusing ${f}: $(ip_plan_get IP_PLAN_BLOCK) is already outside the IPAM pool of ${SUBNET}"
+    return 0
+  fi
+  subnet_json=$(pc_api GET "/api/nutanix/v3/subnets/${SUBNET_UUID}" 2>/dev/null) \
+    || { warn "Could not read subnet ${SUBNET}; skipping the IP plan."; return 0; }
+  pools=$(subnet_pools "$subnet_json")
+  if [[ -z $pools ]]; then warn "${SUBNET} has no IPAM pool; nothing to reserve. Enter the addresses yourself."; return 0; fi
+  load_vms || warn "Could not list the VMs; only ping will detect used addresses."
+  used_file=$(mktemp)
+  used_ips "$subnet_json" >"$used_file"
+  for try in 1 2 3 4 5; do
+    plan=$(ip_select "$pools" "$used_file" "$IP_PLAN_MAX" "$IP_PLAN_MIN" "$IP_PLAN_NODE_RESERVE") || {
+      rm -f "$used_file"
+      die "The IPAM pool ${pools} of ${SUBNET} has no run of ${IP_PLAN_MIN} free addresses (keeping ${IP_PLAN_NODE_RESERVE} for nodes). Free some, or rerun with --no-ip-plan."
+    }
+    responders=$(range_responders "$(sed -n 's/^IP_PLAN_BLOCK=//p' <<<"$plan")")
+    [[ -n $responders ]] || break
+    warn "Attempt ${try}: addresses answering ping in the candidate block: ${responders//$'\n'/ }"
+    printf '%s\n' "$responders" >>"$used_file"
+  done
+  rm -f "$used_file"
+  [[ -z $responders ]] || die "Could not find a block of addresses that nobody answers on. Rerun with --no-ip-plan."
+  while IFS='=' read -r k v; do printf -v "$k" '%s' "$v"; done <<<"$plan"
+
+  dns_ip=$(lab_dns_ip)
+  if [[ -z $dns_ip ]]; then
+    warn "No VM named '${LAB_DNS_VM}' with an IPv4 address; the subnet's DNS settings stay unchanged."
+  elif ! dns_answers "$dns_ip" "$LAB_DOMAIN"; then
+    warn "${LAB_DNS_VM} (${dns_ip}) does not resolve ${LAB_DOMAIN}; the subnet's DNS settings stay unchanged."
+  else
+    ok "${LAB_DNS_VM} (${dns_ip}) resolves ${LAB_DOMAIN}"
+    IP_PLAN_DNS=$dns_ip IP_PLAN_DOMAIN=$LAB_DOMAIN
+    dhcp_new=$(jq -nc --arg ip "$dns_ip" --arg d "$LAB_DOMAIN" '{domain_name_server_list: [$ip], domain_name: $d, domain_search_list: [$d]}')
+  fi
+
+  row "IPAM pool of ${SUBNET}" "$pools"
+  row "Reserve for NKP" "${IP_PLAN_BLOCK} (${IP_PLAN_COUNT} addresses)"
+  row "New IPAM pool" "${IP_PLAN_NEW_POOLS:-none}"
+  row "Management cluster" "API ${MGMT_CONTROLPLANE_IP}, load balancer ${MGMT_LB_RANGE}"
+  row "Workload cluster" "API ${WL_CONTROLPLANE_IP}, load balancer ${WL_LB_RANGE}"
+  if [[ -n $IP_PLAN_DNS ]]; then row "DHCP DNS server / domain" "${IP_PLAN_DNS} / ${IP_PLAN_DOMAIN}"; fi
+  if ! ask_yn "Apply this to subnet ${SUBNET} in Prism Central (undone by --destroy)?" Y; then
+    info "Subnet unchanged. Enter addresses outside the IPAM pool yourself."
+    return 0
+  fi
+
+  IP_PLAN_ORIGINAL_POOLS=$(jq -c '.spec.resources.ip_config.pool_list // []' <<<"$subnet_json")
+  IP_PLAN_ORIGINAL_DHCP=$(jq -c '.spec.resources.ip_config.dhcp_options // null' <<<"$subnet_json")
+  (
+    umask 077
+    echo "# NKP IP plan written $(date -Is). ${SCRIPT_PATH} --destroy restores the original pool and DHCP options."
+    for k in IP_PLAN_SUBNET IP_PLAN_SUBNET_UUID IP_PLAN_ORIGINAL_POOLS IP_PLAN_ORIGINAL_DHCP IP_PLAN_NEW_POOLS IP_PLAN_BLOCK \
+             IP_PLAN_COUNT IP_PLAN_DNS IP_PLAN_DOMAIN MGMT_CONTROLPLANE_IP WL_CONTROLPLANE_IP MGMT_LB_RANGE WL_LB_RANGE; do
+      printf '%s=%q\n' "$k" "${!k}"
+    done
+  ) >"$f"
+  chmod 600 "$f"
+  body=$(jq -c --argjson pools "$(ranges_to_pools "$IP_PLAN_NEW_POOLS")" --argjson dhcp "$dhcp_new" '
+      {api_version: (.api_version // "3.1"), metadata: .metadata,
+       spec: (.spec | .resources.ip_config.pool_list = $pools
+              | if $dhcp then .resources.ip_config.dhcp_options = ((.resources.ip_config.dhcp_options // {}) + $dhcp) else . end)}' \
+    <<<"$subnet_json")
+  if ! subnet_update "$body"; then
+    rm -f "$f"
+    die "The subnet was not changed. Rerun, or use --no-ip-plan and enter addresses yourself."
+  fi
+  now=$(subnet_pools "$(pc_api GET "/api/nutanix/v3/subnets/${SUBNET_UUID}" 2>/dev/null || true)" 2>/dev/null || true)
+  if [[ $now == "$IP_PLAN_NEW_POOLS" ]]; then ok "IPAM pool of ${SUBNET} is now ${now:-empty}; plan saved to ${f}"
+  else warn "The IPAM pool reads back as '${now}', expected '${IP_PLAN_NEW_POOLS}'. Check the subnet in Prism Central."; fi
+  NODE_POOLS=$IP_PLAN_NEW_POOLS
+}
+
+q_network() { # [ips-only]
+  step "Cluster IP addresses${CLUSTER_NAME:+ for ${CLUSTER_NAME}}"
+  local tries=0 prefix=MGMT
+  if ((WORKLOAD)) || [[ ${1-} == ips-only ]]; then prefix=WL; fi
+  ip_plan_default CONTROLPLANE_IP "${prefix}_CONTROLPLANE_IP"
+  ip_plan_default SERVICE_LB_IP_RANGE "${prefix}_LB_RANGE"
   info "Both values below must be static, unused, and outside the subnet's IPAM/DHCP pool."
   while :; do
+    retry_guard tries
     ask CONTROLPLANE_IP "Kubernetes API (control plane endpoint) IP" v_ip
     if [[ -n $NODE_POOLS ]] && ipcalc ip_in_ranges "$CONTROLPLANE_IP" "$NODE_POOLS"; then
       warn "${CONTROLPLANE_IP} is inside the IPAM pool ${NODE_POOLS}."; continue
@@ -786,7 +1237,9 @@ q_network() {
     fi
     break
   done
+  tries=0
   while :; do
+    retry_guard tries
     ask SERVICE_LB_IP_RANGE "Load balancer IP range for services (first-last; the NKP UI takes the first IP)" v_range
     if [[ -n $NODE_POOLS ]] && ipcalc range_overlaps "$SERVICE_LB_IP_RANGE" "$NODE_POOLS"; then
       warn "The range overlaps the IPAM pool ${NODE_POOLS}."; continue
@@ -808,10 +1261,13 @@ q_network() {
     fi
     break
   done
+  [[ ${1-} != ips-only ]] || return 0
   POD_CIDR=${POD_CIDR:-192.168.0.0/16}
   SERVICE_CIDR=${SERVICE_CIDR:-10.96.0.0/12}
   info "Pod and service networks are internal to the cluster and cannot be changed later."
+  tries=0
   while :; do
+    retry_guard tries
     ask POD_CIDR "Kubernetes pod network CIDR" v_cidr
     ask SERVICE_CIDR "Kubernetes service network CIDR" v_cidr
     if ipcalc cidr_overlap "$POD_CIDR" "$SERVICE_CIDR"; then warn "Pod and service networks overlap."; continue; fi
@@ -876,7 +1332,7 @@ q_access() {
   fi
   ask SSH_PUBLIC_KEY "SSH public key file" v_file
 
-  # Newer nkp builds refuse a connected --self-managed cluster without these; the 2.18 guide does not list them.
+  # A connected --self-managed cluster without a registry mirror requires these.
   NUTANIX_REGISTRY_ARGS=()
   local create_help
   create_help=$(nkp create cluster nutanix --help 2>&1 || true)
@@ -932,6 +1388,15 @@ ask_registry_login() { # USER_VAR SECRET_VAR "Label" "Secret prompt"
   die "${label} login failed three times. Check the token on the Nutanix Portal and rerun with --skip-prereqs."
 }
 
+pc_ntp_servers() { # from CLUSTERS_JSON: Prism Central's NTP list, else the node cluster's
+  jq -r --arg c "$NUTANIX_CLUSTER" '
+      def ntp: [.. | .ntp_server_ip_list? // empty | .[]?
+                | if type == "string" then . else (.ipv4.value? // .fqdn.value? // .value? // empty) end] | unique;
+      ([.entities[]? | select((.status.resources.config.service_list // []) | index("PRISM_CENTRAL")) | ntp] | add // []) as $pc
+      | ([.entities[]? | select(.status.name == $c) | ntp] | add // []) as $pe
+      | (if ($pc | length) > 0 then $pc else $pe end) | join(",")' <<<"$CLUSTERS_JSON" 2>/dev/null || true
+}
+
 q_extras() {
   step "Proxy, NTP and Prism Central onboarding"
   local env_proxy=${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}
@@ -949,8 +1414,84 @@ q_extras() {
   else
     USE_PROXY=N
   fi
+  if [[ -z ${NTP_SERVERS:-} && -n ${CLUSTERS_JSON:-} ]]; then
+    NTP_SERVERS=$(pc_ntp_servers)
+    [[ -z $NTP_SERVERS ]] || info "Prism Central uses NTP ${NTP_SERVERS}"
+  fi
   ask NTP_SERVERS "NTP servers, comma-separated (blank = keep the image defaults)" optional
   if ask_yn "Register the cluster in Prism Central (NKP default)?" "${ONBOARD_PC:-Y}"; then ONBOARD_PC=Y; else ONBOARD_PC=N; fi
+}
+
+CVM_RESERVE_GIB=32  # memory per host taken by the CVM, which the VM list does not show
+NODE_DISK_GIB=80
+
+sizing_need() { # -> "nodes vcpus memory_gib" for the current SIZING values
+  case $SIZING in
+    pro)     echo "$((3 + 4)) $((3 * 4 + 4 * 8)) $((3 * 16 + 4 * 32))" ;;
+    starter) echo "$((3 + MIN_WORKERS)) $((3 * 2 + MIN_WORKERS * 4)) $((3 * 8 + MIN_WORKERS * 8))" ;;
+    *)       echo "$((CP_REPLICAS + WK_REPLICAS)) $((CP_REPLICAS * CP_VCPUS + WK_REPLICAS * WK_VCPUS))" \
+                  "$((CP_REPLICAS * CP_MEMORY + WK_REPLICAS * WK_MEMORY))" ;;
+  esac
+}
+
+capacity_check() { # nodes vcpus memory_gib: everything this run will create on NUTANIX_CLUSTER
+  step "Capacity of ${NUTANIX_CLUSTER}"
+  local nodes=$1 vcpus=$2 mem=$3 disk=$(($1 * NODE_DISK_GIB)) line nhosts="" cores=0 hmem=0 vm_cpu=0 vm_mem=0 cvm free usable sc cap
+  if ((!PC_API_OK)) || [[ -z ${PE_UUID:-} ]]; then warn "Prism Central API not available; skipping the capacity check."; return 0; fi
+  line=$(pc_api GET "/api/clustermgmt/v4.0/config/clusters/${PE_UUID}/hosts" 2>/dev/null \
+    | jq -r '[.data[]?] | "\(length) \(map(.numberOfCpuCores // 0) | add // 0) \(map(.memorySizeBytes // 0) | add // 0 | ./1073741824 | floor)"' \
+    2>/dev/null || true)
+  read -r nhosts cores hmem <<<"$line"
+  if [[ -z $nhosts ]] || ((nhosts == 0 || hmem == 0)); then
+    warn "Could not read the hosts of ${NUTANIX_CLUSTER}; skipping the capacity check."
+    return 0
+  fi
+  if load_vms; then
+    line=$(jq -r --arg u "$PE_UUID" '
+        [.[] | select(.status.cluster_reference.uuid == $u and .status.resources.power_state == "ON") | .status.resources]
+        | "\(map((.num_sockets // 1) * (.num_vcpus_per_socket // 1)) | add // 0) \(map(.memory_size_mib // 0) | add // 0 | ./1024 | floor)"' \
+      "$VMS_FILE" 2>/dev/null || true)
+    read -r vm_cpu vm_mem <<<"$line"
+  else
+    warn "Could not list the VMs; assuming the cluster is empty."
+  fi
+  cvm=$((nhosts * CVM_RESERVE_GIB))
+  free=$((hmem - ${vm_mem:-0} - cvm))
+  usable=$((free * 90 / 100))
+  row "Hosts" "${nhosts}: ${cores} cores, ${hmem} GiB memory"
+  row "Running VMs" "${vm_cpu:-0} vCPU, ${vm_mem:-0} GiB (CVMs about ${cvm} GiB)"
+  row "NKP adds" "${nodes} VMs: ${vcpus} vCPU, ${mem} GiB memory, ${disk} GiB disk"
+  if ((cores > 0 && ${vm_cpu:-0} + vcpus > cores * 4)); then
+    warn "vCPU overcommit would be $(((${vm_cpu:-0} + vcpus) / cores)):1, above 4:1. Expect slow platform applications."
+  fi
+  # shellcheck disable=SC2016
+  sc=$(pc_api GET '/api/clustermgmt/v4.0/config/storage-containers?$limit=100' 2>/dev/null \
+    | jq -c --arg n "$STORAGE_CONTAINER_NAME" --arg u "$PE_UUID" \
+        '[.data[]? | select(.name == $n and ((.clusterExtId // $u) == $u))][0] // empty' 2>/dev/null || true)
+  if [[ -n $sc ]]; then
+    cap=$(storage_free_gib "$sc")
+    if [[ -n $cap ]] && ((disk > cap)); then
+      warn "Storage container ${STORAGE_CONTAINER_NAME} has about ${cap} GiB free; NKP node disks take up to ${disk} GiB (thin provisioned)."
+    elif [[ -n $cap ]]; then
+      ok "Storage: ${disk} GiB of node disks, about ${cap} GiB free in ${STORAGE_CONTAINER_NAME}"
+    fi
+  fi
+  if ((mem > usable)); then
+    warn "Not enough memory: NKP needs ${mem} GiB, about ${usable} GiB is free after the CVMs and a 10% margin."
+    ask_yn "Continue anyway?" N || die "Choose a smaller size (Starter) or free memory on ${NUTANIX_CLUSTER}, then rerun."
+  else
+    ok "Memory: ${mem} GiB needed, about ${usable} GiB free"
+  fi
+}
+
+storage_free_gib() { # storage container JSON (v4) -> free GiB, from its stats when available, else its capacity
+  local id stats used max
+  id=$(jq -r '.containerExtId // .extId // empty' <<<"$1")
+  max=$(jq -r '.maxCapacityBytes // empty' <<<"$1")
+  [[ -n $id && -n $max ]] || return 0
+  stats=$(pc_api GET "/api/clustermgmt/v4.0/stats/storage-containers/${id}?\$startTime=$(date -u -d '-1 hour' +%FT%TZ)&\$endTime=$(date -u +%FT%TZ)&\$statType=LAST&\$samplingInterval=3600" 2>/dev/null || true)
+  used=$(jq -r '[.data.storageUsageBytes[]?.value] | last // empty' <<<"$stats" 2>/dev/null || true)
+  jq -nr --argjson m "$max" --argjson u "${used:-0}" '($m - $u) / 1073741824 | floor'
 }
 
 build_command() {
@@ -1018,7 +1559,11 @@ show_summary() {
   fi
   row "Prism Central" "$NUTANIX_ENDPOINT (user ${NUTANIX_USER}, TLS: ${TLS_MODE})"
   row "Prism Element" "$NUTANIX_CLUSTER"
-  row "Subnet" "$SUBNET${NODE_CIDR:+ ($NODE_CIDR)}"
+  row "Subnet" "$SUBNET${NODE_CIDR:+ ($NODE_CIDR)}${NODE_POOLS:+, IPAM pool $NODE_POOLS}"
+  if [[ -n $(ip_plan_get IP_PLAN_BLOCK) ]]; then
+    row "Reserved for NKP" "$(ip_plan_get IP_PLAN_BLOCK) (${WORKDIR}/nkp-ip-plan.env)"
+    if [[ -n $(ip_plan_get IP_PLAN_DNS) ]]; then row "DHCP DNS / domain" "$(ip_plan_get IP_PLAN_DNS) / $(ip_plan_get IP_PLAN_DOMAIN)"; fi
+  fi
   row "Node image" "$VM_IMAGE"
   row "Storage container" "$STORAGE_CONTAINER_NAME"
   row "Control plane endpoint" "$CONTROLPLANE_IP"
@@ -1121,6 +1666,110 @@ phase_status() {
   info "Clusters in NKP workspaces (workload clusters show Joined once attached):"
   kubectl --kubeconfig "$kcfg" get nkpclusters -A >&2 2>/dev/null || true
   nkp get dashboard --kubeconfig="$kcfg" 2>/dev/null || true
+  if write_lab_summary; then info "Lab summary: ${WORKDIR}/lab-summary.txt"; fi
+}
+
+write_lab_summary() { # -> ${WORKDIR}/lab-summary.txt, mode 600 (it holds the dashboard password)
+  local f="${WORKDIR}/lab-summary.txt" mask
+  [[ -f ${WORKDIR}/nkp-install.env ]] || return 1
+  mask=$(umask)
+  umask 077
+  (
+    # shellcheck disable=SC1090,SC1091
+    . "${WORKDIR}/nkp-install.env"
+    m=$CLUSTER_NAME mk="${WORKDIR}/${CLUSTER_NAME}/${CLUSTER_NAME}.conf"
+    printf 'NKP %s lab, summary written %s\n\n' "$NKP_MINOR" "$(date '+%F %T')"
+    printf '%-22s %s (user %s)\n' "Prism Central" "$NUTANIX_ENDPOINT" "$NUTANIX_USER"
+    printf '%-22s %s\n' "Prism Element" "$NUTANIX_CLUSTER" "Subnet" "${SUBNET}${NODE_CIDR:+ (${NODE_CIDR})}"
+    if [[ -n $(ip_plan_get IP_PLAN_BLOCK) ]]; then
+      printf '%-22s %s\n' "Reserved for NKP" "$(ip_plan_get IP_PLAN_BLOCK) (IPAM pool now: $(ip_plan_get IP_PLAN_NEW_POOLS))"
+      if [[ -n $(ip_plan_get IP_PLAN_DNS) ]]; then
+        printf '%-22s %s\n' "DHCP DNS / domain" "$(ip_plan_get IP_PLAN_DNS) (${LAB_DNS_VM}) / $(ip_plan_get IP_PLAN_DOMAIN)"
+      fi
+    fi
+    printf '\nManagement cluster     %s\n' "$m"
+    printf '  %-20s %s\n' "API endpoint" "https://${CONTROLPLANE_IP}:6443" "Load balancer range" "$SERVICE_LB_IP_RANGE" "Kubeconfig" "$mk"
+    if [[ -f $mk ]]; then
+      printf '  Dashboard\n'
+      nkp get dashboard --kubeconfig="$mk" 2>/dev/null | sed 's/^/    /' || echo "    (not available yet: nkp get dashboard --kubeconfig=${mk})"
+    fi
+    if [[ -f ${WORKDIR}/nkp-workload.env ]]; then
+      # shellcheck disable=SC1090,SC1091
+      . "${WORKDIR}/nkp-workload.env"
+      printf '\nWorkload cluster       %s (workspace %s)\n' "$CLUSTER_NAME" "$WORKSPACE_NAMESPACE"
+      printf '  %-20s %s\n' "API endpoint" "https://${CONTROLPLANE_IP}:6443" "Load balancer range" "$SERVICE_LB_IP_RANGE" \
+        "Kubeconfig" "${WORKDIR}/${CLUSTER_NAME}/${CLUSTER_NAME}.conf"
+      if [[ -f $mk ]]; then
+        printf '  %-20s %s\n' "State" "$(kubectl --kubeconfig "$mk" -n "$WORKSPACE_NAMESPACE" get nkpclusters "$CLUSTER_NAME" --no-headers 2>/dev/null || echo unknown)"
+      fi
+    fi
+    cat <<EOF
+
+Commands
+  export KUBECONFIG=${mk}
+  kubectl get nkpclusters -A
+  nkp get dashboard
+  nkp get nodepools -c ${m} -n kommander
+
+  Status:                ${SCRIPT_PATH} --status
+  Another workload:      ${SCRIPT_PATH} --workload
+  Delete the whole lab:  ${SCRIPT_PATH} --destroy
+EOF
+  ) >"$f.tmp" 2>/dev/null || true
+  umask "$mask"
+  mv -f "$f.tmp" "$f"
+  chmod 600 "$f"
+}
+
+helmreleases_not_ready() { # kubeconfig namespace -> prints HelmReleases that are not Ready; exit 1 if none exist yet
+  local out
+  out=$(kubectl --kubeconfig "$1" -n "$2" get helmreleases --no-headers 2>/dev/null || true)
+  [[ -n $out ]] || return 1
+  awk '$3 != "True"' <<<"$out"
+}
+
+wait_helmreleases() { # kubeconfig namespace minutes -> 0 once every HelmRelease is Ready
+  local i out
+  for ((i = 0; i < $3 * 6; i++)); do
+    if out=$(helmreleases_not_ready "$1" "$2") && [[ -z $out ]]; then return 0; fi
+    sleep 10
+  done
+  return 1
+}
+
+remediate_apps() { # kubeconfig cluster hr_namespace management_kubeconfig: add workers for unschedulable pods, retry failed apps
+  local kcfg=$1 cluster=$2 hr_ns=$3 mgmt=$4 attempt starved md md_ns md_name replicas ts failed hr
+  for attempt in 1 2; do
+    starved=$(kubectl --kubeconfig "$kcfg" get pods -A --field-selector=status.phase=Pending -o json 2>/dev/null \
+      | jq -r '.items[] | select(any(.status.conditions[]?; .type == "PodScheduled" and .status == "False"
+                 and ((.message // "") | test("Insufficient (cpu|memory)")))) | "\(.metadata.namespace)/\(.metadata.name)"' \
+      2>/dev/null || true)
+    if [[ -n $starved ]]; then
+      warn "Pods that cannot be scheduled for lack of CPU or memory: ${starved//$'\n'/ }"
+      md=$(kubectl --kubeconfig "$mgmt" get machinedeployments -A -l "cluster.x-k8s.io/cluster-name=${cluster}" -o json 2>/dev/null \
+        | jq -r '[.items[] | select((.metadata.labels["topology.cluster.x-k8s.io/deployment-name"] // .metadata.name) | test("md-0"))][0]
+                 // empty | "\(.metadata.namespace) \(.metadata.name) \(.spec.replicas)"' 2>/dev/null || true)
+      read -r md_ns md_name replicas <<<"$md"
+      if [[ ! ${replicas:-} =~ ^[0-9]+$ ]]; then warn "Could not find node pool md-0 of ${cluster}; scale it yourself."; break; fi
+      ask_yn "Add a worker to ${cluster} (md-0: ${replicas} -> $((replicas + 1)), attempt ${attempt} of 2)?" Y || break
+      if ! nkp scale nodepools md-0 --replicas="$((replicas + 1))" -c "$cluster" -n "$md_ns" --kubeconfig="$mgmt" >&2; then
+        warn "Scaling md-0 failed."; break
+      fi
+      info "Waiting for the new worker (up to 20 minutes)..."
+      kubectl --kubeconfig "$mgmt" -n "$md_ns" wait --for=jsonpath='{.status.readyReplicas}'="$((replicas + 1))" \
+        "machinedeployments.cluster.x-k8s.io/${md_name}" --timeout=20m >&2 || warn "The new worker is not ready yet."
+    fi
+    failed=$(helmreleases_not_ready "$kcfg" "$hr_ns" | awk '{print $1}' || true)
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    for hr in $failed; do
+      kubectl --kubeconfig "$kcfg" -n "$hr_ns" annotate --overwrite "helmreleases.helm.toolkit.fluxcd.io/${hr}" \
+        "reconcile.fluxcd.io/requestedAt=${ts}" "reconcile.fluxcd.io/resetAt=${ts}" "reconcile.fluxcd.io/forceAt=${ts}" >/dev/null 2>&1 || true
+    done
+    info "Retrying ${failed//$'\n'/ }; waiting up to 20 more minutes..."
+    if wait_helmreleases "$kcfg" "$hr_ns" 20; then ok "All platform applications are ready"; return 0; fi
+    [[ -n $starved ]] || break
+  done
+  return 1
 }
 
 post_install() {
@@ -1134,10 +1783,13 @@ post_install() {
   ok "Kubeconfig: ${kcfg}"
   kubectl --kubeconfig "$kcfg" get nodes -o wide || true
   info "Waiting for the NKP platform applications (up to 30 minutes)..."
-  if kubectl --kubeconfig "$kcfg" -n kommander wait --for condition=Ready helmreleases --all --timeout 30m; then
+  if wait_helmreleases "$kcfg" kommander 30; then
     ok "All platform applications are ready"
   else
-    warn "Some applications are not ready yet. Check: kubectl --kubeconfig ${kcfg} -n kommander get helmreleases"
+    warn "Platform applications not ready after 30 minutes:"
+    helmreleases_not_ready "$kcfg" kommander | sed 's/^/      /' >&2 || true
+    remediate_apps "$kcfg" "$CLUSTER_NAME" kommander "$kcfg" \
+      || warn "Some applications are still not ready. Check: ${SCRIPT_PATH} --status"
   fi
   step "NKP dashboard"
   nkp get dashboard --kubeconfig="$kcfg" || true
@@ -1150,7 +1802,7 @@ post_install() {
       Node pool commands on this cluster need: -n kommander
       Workload clusters: ${SCRIPT_PATH} --workload
 EOF
-  if ask_yn "Create a workload cluster on ${CLUSTER_NAME} now?" N; then
+  if ((!LAB)) && ask_yn "Create a workload cluster on ${CLUSTER_NAME} now?" N; then
     local args=(--workload --workdir "$WORKDIR")
     if ((FORCE_INSECURE)); then args+=(--insecure); fi
     exec bash "$SCRIPT_PATH" "${args[@]}"
@@ -1167,6 +1819,62 @@ phase_setup() {
   q_cluster
   q_prism_central
   q_inventory
+  lab_network
+  q_network
+  q_sizing
+  q_access
+  q_extras
+  save_answers
+  ok "Answers saved to ${ANSWERS_FILE} (no passwords)"
+  # shellcheck disable=SC2046
+  capacity_check $(sizing_need)
+  build_command
+  show_summary
+  export NUTANIX_USER NUTANIX_PASSWORD
+  run_preflight
+  run_create
+  post_install
+}
+
+v_lab_workload_name() {
+  v_cluster_name "$1" || return 1
+  if [[ $1 == "$MGMT_CLUSTER_NAME" ]]; then echo "      That is the management cluster's name." >&2; return 1; fi
+}
+
+q_lab_workload() { # workload answers asked up front, checked offline: the management cluster does not exist yet
+  step "First workload cluster"
+  local mgmt_ranges="${CONTROLPLANE_IP}-${CONTROLPLANE_IP},${SERVICE_LB_IP_RANGE}" mgmt_args=("${SIZING_ARGS[@]}") saved=$ANSWERS_FILE
+  MGMT_CLUSTER_NAME=$CLUSTER_NAME
+  swap_wl
+  CLUSTER_NAME=${CLUSTER_NAME:-nkp-workload1}
+  ask CLUSTER_NAME "Workload cluster name" v_lab_workload_name
+  WORKSPACE_NAMESPACE=${WORKSPACE_NAMESPACE:-kommander-default-workspace}
+  ask WORKSPACE_NAMESPACE "Workspace namespace for it (created if missing)" v_dns_label
+  RESERVED_RANGES=$mgmt_ranges
+  q_network ips-only
+  RESERVED_RANGES=""
+  SIZING=${SIZING:-$WL_SIZING}
+  q_sizing
+  WL_NEED=$(sizing_need)
+  ANSWERS_FILE="${WORKDIR}/nkp-workload.env"
+  save_answers
+  ANSWERS_FILE=$saved
+  swap_wl
+  SIZING_ARGS=("${mgmt_args[@]}")
+  ok "Workload answers saved to ${WORKDIR}/nkp-workload.env"
+}
+
+phase_lab() {
+  step "NKP ${NKP_MINOR} lab: management cluster and first workload cluster"
+  command -v nkp >/dev/null || die "nkp CLI not found. Run without --skip-prereqs first."
+  ensure_docker_access
+  ensure_tmux_session
+  PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NUTANIX_REGISTRY_ARGS=() NODE_CIDR="" NODE_POOLS=""
+  load_answers
+  q_cluster
+  q_prism_central
+  q_inventory
+  lab_network
   q_network
   q_sizing
   q_access
@@ -1174,11 +1882,35 @@ phase_setup() {
   save_answers
   ok "Answers saved to ${ANSWERS_FILE} (no passwords)"
   build_command
+  local mgmt_need n1 c1 m1 n2 c2 m2 args rc=0
+  mgmt_need=$(sizing_need)
+  q_lab_workload
+  read -r n1 c1 m1 <<<"$mgmt_need"
+  read -r n2 c2 m2 <<<"$WL_NEED"
+  capacity_check $((n1 + n2)) $((c1 + c2)) $((m1 + m2))
   show_summary
+  step "Then, from ${CLUSTER_NAME}: workload cluster ${WL_CLUSTER_NAME}"
+  row "Workspace namespace" "$WL_WORKSPACE_NAMESPACE"
+  row "Control plane endpoint" "$WL_CONTROLPLANE_IP"
+  row "Load balancer range" "$WL_LB_RANGE"
+  row "Sizing" "$WL_SIZING"
+  ask_yn "Create ${CLUSTER_NAME} and then ${WL_CLUSTER_NAME} now, without further questions (about 90 minutes)?" Y \
+    || { info "Answers saved; rerun with: ${SCRIPT_PATH} --lab --skip-prereqs"; exit 0; }
+  UNATTENDED=1
   export NUTANIX_USER NUTANIX_PASSWORD
   run_preflight
   run_create
   post_install
+
+  step "Creating workload cluster ${WL_CLUSTER_NAME}"
+  args=(--workload --unattended --skip-prereqs --workdir "$WORKDIR")
+  if ((FORCE_INSECURE)); then args+=(--insecure); fi
+  if [[ -n ${DOCKERHUB_PASSWORD:-} ]]; then export DOCKERHUB_PASSWORD; fi
+  NKP_LAB_CHILD=1 bash "$SCRIPT_PATH" "${args[@]}" || rc=$?
+  ((rc == 0)) || warn "The workload cluster run ended with exit ${rc}. Rerun it with: ${SCRIPT_PATH} --workload"
+  write_lab_summary || true
+  step "Lab summary (${WORKDIR}/lab-summary.txt)"
+  sed 's/^/    /' "${WORKDIR}/lab-summary.txt" >&2 || true
 }
 
 # ---------------------------------------------------------------------------
@@ -1221,11 +1953,21 @@ q_workspace() {
     if [[ -n $ns ]]; then vals+=("$ns"); labels+=("${name}  (namespace ${ns})"); fi
   done < <("${MGMT_K[@]}" get workspaces.workspaces.kommander.mesosphere.io -o json 2>/dev/null \
     | jq -r '.items[] | [.metadata.name, (.spec.namespaceName // .status.namespaceRef.name // "")] | @tsv' || true)
-  vals+=(new); labels+=("Create a new workspace")
   WORKSPACE_NAMESPACE=${WORKSPACE_NAMESPACE:-kommander-default-workspace}
-  pick WORKSPACE_NAMESPACE "Workspace for ${CLUSTER_NAME}" vals labels
+  local known=0
+  for ns in "${vals[@]}"; do
+    if [[ $ns == "$WORKSPACE_NAMESPACE" ]]; then known=1; fi
+  done
+  vals+=(new); labels+=("Create a new workspace")
+  if ((UNATTENDED && !known)); then
+    ws=$WORKSPACE_NAMESPACE WORKSPACE_NAMESPACE=new
+    v_dns_label "$ws" || die "--unattended: invalid workspace name ${ws}."
+    info "Workspace ${ws} does not exist; creating it."
+  else
+    pick WORKSPACE_NAMESPACE "Workspace for ${CLUSTER_NAME}" vals labels
+  fi
   if [[ $WORKSPACE_NAMESPACE == new ]]; then
-    ask ws "New workspace name (also its namespace)" v_dns_label
+    [[ -n $ws ]] || ask ws "New workspace name (also its namespace)" v_dns_label
     "${MGMT_K[@]}" apply -f - >/dev/null <<EOF || die "Could not create workspace ${ws}."
 apiVersion: workspaces.kommander.mesosphere.io/v1alpha1
 kind: Workspace
@@ -1248,7 +1990,7 @@ EOF
 }
 
 post_workload() {
-  local kcfg="${CLUSTER_DIR}/${CLUSTER_NAME}.conf" i out total pending joined=0
+  local kcfg="${CLUSTER_DIR}/${CLUSTER_NAME}.conf" i out joined=0
   local describe=(nkp describe cluster -c "$CLUSTER_NAME" -n "$WORKSPACE_NAMESPACE" --kubeconfig="$MGMT_KCFG")
   step "Waiting for ${CLUSTER_NAME}"
   info "${MGMT_CLUSTER_NAME} provisions the VMs; this usually takes 15-30 minutes. Progress: ${describe[*]}"
@@ -1277,18 +2019,15 @@ post_workload() {
   else warn "${CLUSTER_NAME} has not joined yet. Check: kubectl --kubeconfig ${MGMT_KCFG} get nkpclusters -A"; fi
 
   info "Waiting for the platform applications on ${CLUSTER_NAME} (up to 30 minutes)..."
-  for ((i = 0; i < 180; i++)); do
-    out=$(kubectl --kubeconfig "$kcfg" -n "$WORKSPACE_NAMESPACE" get helmreleases --no-headers 2>/dev/null || true)
-    total=$(grep -c . <<<"$out" || true)
-    pending=$(awk '$3 != "True"' <<<"$out" | grep -c . || true)
-    if ((total > 0 && pending == 0)); then break; fi
-    sleep 10
-  done
-  if ((total > 0 && pending == 0)); then ok "All ${total} platform applications are ready"
+  if wait_helmreleases "$kcfg" "$WORKSPACE_NAMESPACE" 30; then
+    ok "All platform applications are ready"
   else
-    warn "${pending} of ${total} platform applications are not ready yet:"
-    awk '$3 != "True"' <<<"$out" | sed 's/^/      /' >&2 || true
-    info "Pending pods? Add workers: nkp scale nodepools md-0 --replicas=<n> -c ${CLUSTER_NAME} -n ${WORKSPACE_NAMESPACE} --kubeconfig=${MGMT_KCFG}"
+    warn "Platform applications not ready after 30 minutes:"
+    helmreleases_not_ready "$kcfg" "$WORKSPACE_NAMESPACE" | sed 's/^/      /' >&2 || true
+    if ! remediate_apps "$kcfg" "$CLUSTER_NAME" "$WORKSPACE_NAMESPACE" "$MGMT_KCFG"; then
+      warn "Some applications are still not ready."
+      info "Add workers: nkp scale nodepools md-0 --replicas=<n> -c ${CLUSTER_NAME} -n ${WORKSPACE_NAMESPACE} --kubeconfig=${MGMT_KCFG}"
+    fi
   fi
   cat >&2 <<EOF
 
@@ -1310,7 +2049,10 @@ phase_workload() {
   load_mgmt_context
   CLUSTER_NAME="" CONTROLPLANE_IP="" SERVICE_LB_IP_RANGE=""
   ANSWERS_FILE="${WORKDIR}/nkp-workload.env"
-  if [[ -f $ANSWERS_FILE ]] && ask_yn "Found answers from a previous workload cluster. Use them as defaults?" Y; then
+  if load_config; then
+    CLUSTER_NAME="" CONTROLPLANE_IP="" SERVICE_LB_IP_RANGE="" WORKSPACE_NAMESPACE=""
+    apply_wl
+  elif [[ -f $ANSWERS_FILE ]] && ask_yn "Found answers from a previous workload cluster. Use them as defaults?" Y; then
     # shellcheck disable=SC1090
     . "$ANSWERS_FILE"
   else
@@ -1327,6 +2069,8 @@ phase_workload() {
   q_extras
   save_answers
   ok "Answers saved to ${ANSWERS_FILE} (no passwords)"
+  # shellcheck disable=SC2046
+  capacity_check $(sizing_need)
   build_command
   show_summary
   export NUTANIX_USER NUTANIX_PASSWORD
@@ -1335,12 +2079,120 @@ phase_workload() {
   post_workload
 }
 
+# ---------------------------------------------------------------------------
+# Destroy: workload clusters, the management cluster, then the subnet changes
+# ---------------------------------------------------------------------------
+
+restore_subnet() {
+  local f subnet_json pools dhcp body
+  f=$(ip_plan_file)
+  if [[ ! -f $f ]]; then info "No IP plan in ${WORKDIR}; the subnet was not changed by this script."; return 0; fi
+  SUBNET_UUID=$(ip_plan_get IP_PLAN_SUBNET_UUID)
+  pools=$(ip_plan_get IP_PLAN_ORIGINAL_POOLS)
+  dhcp=$(ip_plan_get IP_PLAN_ORIGINAL_DHCP)
+  [[ -n $(ip_plan_get IP_PLAN_DNS) ]] || dhcp=keep
+  step "Restoring subnet $(ip_plan_get IP_PLAN_SUBNET)"
+  subnet_json=$(pc_api GET "/api/nutanix/v3/subnets/${SUBNET_UUID}" 2>/dev/null) \
+    || die "Cannot read subnet ${SUBNET_UUID} from Prism Central; ${f} is kept so you can rerun --destroy."
+  body=$(jq -c --argjson pools "${pools:-[]}" --arg dhcp "$dhcp" '
+      {api_version: (.api_version // "3.1"), metadata: .metadata,
+       spec: (.spec | .resources.ip_config.pool_list = $pools
+              | if $dhcp == "keep" then .
+                elif $dhcp == "null" then del(.resources.ip_config.dhcp_options)
+                else .resources.ip_config.dhcp_options = ($dhcp | fromjson) end)}' <<<"$subnet_json")
+  subnet_update "$body" || die "Restoring the subnet failed; ${f} is kept so you can rerun --destroy."
+  ok "IPAM pool restored to $(jq -r '[.[].range | gsub(" +"; "-")] | join(",")' <<<"${pools:-[]}")"
+}
+
+pc_login_from_answers() { # TLS settings and password for Prism Central API calls outside the setup flow
+  case ${TLS_MODE:-insecure} in
+    trusted) PC_TLS_ARGS=() ;;
+    cafile)  PC_TLS_ARGS=(--cacert "${CLUSTER_DIR}/prism-central-ca.pem") ;;
+    *)       PC_TLS_ARGS=(-k) ;;
+  esac
+  PC_HOST=${NUTANIX_ENDPOINT#*://} PC_HOST=${PC_HOST%:*}
+  local i code
+  for i in 1 2 3; do
+    ask_secret NUTANIX_PASSWORD "Prism Central password for ${NUTANIX_USER}"
+    code=$(pc_status /api/nutanix/v3/users/me)
+    if [[ $code == 200 ]]; then return 0; fi
+    warn "Prism Central login failed (HTTP ${code})."
+    NUTANIX_PASSWORD=""
+  done
+  die "Cannot log in to Prism Central."
+}
+
+phase_destroy() {
+  step "Destroy the NKP lab"
+  local f="${WORKDIR}/nkp-install.env" kcfg json ns name mgmt_ns boot confirm archive reachable=0
+  [[ -f $f ]] || die "No answers at ${f}: nothing created by this script is known here (use --workdir)."
+  # shellcheck disable=SC1090
+  . "$f"
+  CLUSTER_DIR="${WORKDIR}/${CLUSTER_NAME}"
+  kcfg="${CLUSTER_DIR}/${CLUSTER_NAME}.conf"
+  warn "This deletes ${CLUSTER_NAME}, every workload cluster it manages and all their VMs, then restores the subnet."
+  if ((UNATTENDED)); then
+    [[ ${NKP_DESTROY_CONFIRM:-} == "$CLUSTER_NAME" ]] \
+      || die "--unattended --destroy needs NKP_DESTROY_CONFIRM=${CLUSTER_NAME} in the environment."
+  else
+    read -r -p "    Type the management cluster name (${CLUSTER_NAME}) to confirm: " confirm </dev/tty
+    [[ $confirm == "$CLUSTER_NAME" ]] || die "Not confirmed; nothing was deleted."
+  fi
+  pc_login_from_answers
+  export NUTANIX_USER NUTANIX_PASSWORD
+  ensure_docker_access
+
+  if [[ -f $kcfg ]] && json=$(kubectl --kubeconfig "$kcfg" get clusters.cluster.x-k8s.io -A -o json 2>/dev/null); then
+    reachable=1
+  fi
+  if ((reachable)); then
+    while read -r ns name; do
+      [[ -n $name && $name != "$CLUSTER_NAME" ]] || continue
+      step "Deleting workload cluster ${name} (namespace ${ns})"
+      nkp delete cluster -c "$name" -n "$ns" --kubeconfig="$kcfg" >&2 || warn "nkp delete cluster ${name} reported an error."
+      kubectl --kubeconfig "$kcfg" -n "$ns" wait --for=delete "clusters.cluster.x-k8s.io/${name}" --timeout=30m >&2 \
+        || die "${name} is still being deleted. Rerun --destroy once it is gone."
+    done < <(jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name)"' <<<"$json")
+    mgmt_ns=$(jq -r --arg n "$CLUSTER_NAME" '[.items[] | select(.metadata.name == $n) | .metadata.namespace][0] // "default"' <<<"$json")
+
+    step "Deleting management cluster ${CLUSTER_NAME}"
+    if [[ $(nkp delete cluster --help 2>&1 || true) == *--self-managed* ]]; then
+      nkp delete cluster -c "$CLUSTER_NAME" -n "$mgmt_ns" --self-managed --kubeconfig="$kcfg" >&2 \
+        || die "Deleting ${CLUSTER_NAME} failed; the subnet was not restored. Rerun --destroy."
+    else
+      boot="${WORKDIR}/bootstrap.conf"
+      info "Moving the cluster's Cluster API objects to a local bootstrap cluster, which then deletes it."
+      nkp create bootstrap --kubeconfig="$boot" >&2 || die "nkp create bootstrap failed."
+      nkp move capi-resources --from-kubeconfig="$kcfg" --to-kubeconfig="$boot" >&2 \
+        || die "nkp move capi-resources failed; ${CLUSTER_NAME} is untouched. Remove the bootstrap with: nkp delete bootstrap --kubeconfig=${boot}"
+      nkp delete cluster -c "$CLUSTER_NAME" -n "$mgmt_ns" --kubeconfig="$boot" >&2 \
+        || die "Deleting ${CLUSTER_NAME} failed. Its objects are on the bootstrap cluster (${boot}); retry: nkp delete cluster -c ${CLUSTER_NAME} -n ${mgmt_ns} --kubeconfig=${boot}"
+      nkp delete bootstrap --kubeconfig="$boot" >&2 || warn "Could not remove the bootstrap cluster: nkp delete bootstrap --kubeconfig=${boot}"
+    fi
+    ok "${CLUSTER_NAME} deleted"
+  else
+    warn "${CLUSTER_NAME} is not reachable with ${kcfg}; no cluster was deleted."
+    ask_yn "Restore the subnet anyway?" N || exit 1
+  fi
+
+  restore_subnet
+  archive="${WORKDIR}/archive-$(date +%Y%m%d-%H%M%S)"
+  mkdir -m 700 "$archive"
+  for f in nkp-ip-plan.env nkp-install.env nkp-workload.env lab-summary.txt; do
+    if [[ -f ${WORKDIR}/${f} ]]; then mv "${WORKDIR}/${f}" "$archive/"; fi
+  done
+  ok "Answers and IP plan moved to ${archive}"
+}
+
 main() {
   parse_args "$@"
+  if ((INIT_CONFIG)); then init_config; return 0; fi
   if ((STATUS_ONLY)); then phase_status; return 0; fi
+  if ((DESTROY)); then phase_destroy; return 0; fi
   if ((WORKLOAD)); then phase_workload; return 0; fi
-  ((DO_PREREQS)) && phase_prereqs
-  ((DO_SETUP)) && phase_setup
+  if ((DO_PREREQS)); then phase_prereqs; fi
+  if ((!DO_SETUP)); then return 0; fi
+  if ((LAB)); then phase_lab; else phase_setup; fi
   return 0
 }
 
