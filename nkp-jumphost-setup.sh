@@ -19,6 +19,7 @@
 #   --skip-prereqs    Run phase 2 only.
 #   --print-only      Do everything except the final cluster creation; print the command.
 #   --insecure        Do not verify Prism Central's TLS certificate, without asking.
+#   --status          Show what is still not ready on a cluster this script already created.
 #   -h, --help        Show this help.
 #
 # Passwords are not saved in the answers file; to skip their prompts, export NUTANIX_PASSWORD,
@@ -46,6 +47,7 @@ DO_PREREQS=1
 DO_SETUP=1
 PRINT_ONLY=0
 FORCE_INSECURE=0
+STATUS_ONLY=0
 
 if [[ -t 1 ]]; then
   C_B=$'\e[1m' C_G=$'\e[32m' C_Y=$'\e[33m' C_R=$'\e[31m' C_C=$'\e[36m' C_0=$'\e[0m'
@@ -74,6 +76,7 @@ parse_args() {
       --skip-prereqs) DO_PREREQS=0 ;;
       --print-only)   PRINT_ONLY=1 ;;
       --insecure)     FORCE_INSECURE=1 ;;
+      --status)       STATUS_ONLY=1 ;;
       -h|--help)      usage; exit 0 ;;
       *)              die "Unknown option: $1 (see --help)" ;;
     esac
@@ -999,10 +1002,48 @@ run_create() {
   step "Creating ${CLUSTER_NAME} (log: ${LOG})"
   if ! (cd "$CLUSTER_DIR" && "${CMD[@]}") 2>&1 | tee -a "$LOG"; then
     err "Cluster creation failed. Full log: ${LOG}"
-    info "If a local bootstrap cluster was left behind, remove it with: nkp delete bootstrap"
-    info "Fix the cause, then rerun: ${SCRIPT_PATH} --skip-prereqs"
+    if [[ -f ${CLUSTER_DIR}/${CLUSTER_NAME}.conf ]]; then
+      warn "The cluster itself exists (its VMs are running); only the steps after it failed."
+      warn "Do not rerun the setup: it would try to create ${CLUSTER_NAME} again."
+      cluster_status "${CLUSTER_DIR}/${CLUSTER_NAME}.conf"
+      info "Platform apps keep retrying on their own. Check again with: ${SCRIPT_PATH} --status"
+    else
+      info "If a local bootstrap cluster was left behind, remove it with: nkp delete bootstrap"
+      info "Fix the cause, then rerun: ${SCRIPT_PATH} --skip-prereqs"
+    fi
     exit 1
   fi
+}
+
+cluster_status() { # kubeconfig
+  local k=(kubectl --kubeconfig "$1") out
+  step "Cluster status (${1})"
+  "${k[@]}" get nodes -o wide >&2 || { warn "The cluster API is not reachable with this kubeconfig."; return 0; }
+  out=$("${k[@]}" -n kommander get helmreleases 2>&1 | awk 'NR == 1 || $0 !~ /True/' || true)
+  if [[ $(wc -l <<<"$out") -le 1 ]]; then ok "All platform applications are ready"
+  else info "Platform applications not ready:"; printf '%s\n' "$out" >&2; fi
+  out=$("${k[@]}" get pods -A 2>&1 | awk 'NR == 1 || ($4 != "Running" && $4 != "Completed") || $3 ~ /^0\//' || true)
+  if [[ $(wc -l <<<"$out") -gt 1 ]]; then info "Pods not running or not ready:"; printf '%s\n' "$out" >&2; fi
+  info "Load balancer services (the ingress needs an EXTERNAL-IP from the service IP range):"
+  "${k[@]}" get svc -A 2>&1 | awk 'NR == 1 || /LoadBalancer/' >&2 || true
+  info "Recent warning events:"
+  "${k[@]}" get events -A --field-selector type=Warning --sort-by=.lastTimestamp 2>&1 | tail -15 >&2 || true
+  info "Node usage:"
+  "${k[@]}" top nodes >&2 2>/dev/null || info "(metrics not available yet)"
+}
+
+phase_status() {
+  local kcfg
+  ANSWERS_FILE="${WORKDIR}/nkp-install.env"
+  if [[ -f $ANSWERS_FILE ]]; then
+    # shellcheck disable=SC1090
+    . "$ANSWERS_FILE"
+  fi
+  CLUSTER_NAME=${CLUSTER_NAME:-nkp-mgmt}
+  kcfg="${WORKDIR}/${CLUSTER_NAME}/${CLUSTER_NAME}.conf"
+  [[ -f $kcfg ]] || die "No kubeconfig at ${kcfg}. Has the cluster been created? (use --workdir if it lives elsewhere)"
+  cluster_status "$kcfg"
+  nkp get dashboard --kubeconfig="$kcfg" 2>/dev/null || true
 }
 
 post_install() {
@@ -1059,6 +1100,7 @@ phase_setup() {
 
 main() {
   parse_args "$@"
+  if ((STATUS_ONLY)); then phase_status; return 0; fi
   ((DO_PREREQS)) && phase_prereqs
   ((DO_SETUP)) && phase_setup
   return 0
