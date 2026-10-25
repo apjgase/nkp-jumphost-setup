@@ -12,6 +12,10 @@
 #         waits until the cluster has joined the workspace and its platform applications are ready.
 # --lab   does all of it in one go: every question up front, then the management cluster and the first
 #         workload cluster unattended, ending with lab-summary.txt.
+# Images: with the air-gapped bundle (nkp-air-gapped-bundle_*) extracted, the management cluster is
+#         created with --bundle, which seeds its internal registry (Harbor, namespace ncr-system); workload
+#         clusters then pull from that registry instead of Docker Hub. Images outside the bundle still
+#         come from the internet.
 #
 # Usage:
 #   ./nkp-jumphost-setup.sh --lab [--config nkp-lab.env]
@@ -23,6 +27,8 @@
 #   --package PATH    NKP package from the Nutanix Portal (nkp_*, nkp-bundle_* or
 #                     nkp-air-gapped-bundle_*.tar.gz). Auto-detected in the current
 #                     directory, $HOME and $HOME/Downloads when omitted.
+#   --bundle-dir DIR  container-images directory of the extracted air-gapped bundle. Default: found
+#                     under $HOME/nkp-dist, where --package extracts nkp-air-gapped-bundle_*.
 #   --workdir DIR     Where answers, logs and the kubeconfig are kept (default: $HOME/nkp).
 #   --prereqs-only    Run phase 1 only.
 #   --skip-prereqs    Run phase 2 only.
@@ -43,7 +49,7 @@
 #   -h, --help        Show this help.
 #
 # Passwords are not saved in the answers file; to skip their prompts, export NUTANIX_PASSWORD,
-# DOCKERHUB_PASSWORD and NUTANIX_REGISTRY_PASSWORD before running. The preflight dry-run manifest (cluster-dryrun.yaml,
+# DOCKERHUB_PASSWORD and NUTANIX_REGISTRY_PASSWORD (optional with the bundle) before running. The preflight dry-run manifest (cluster-dryrun.yaml,
 # mode 600) does contain the credentials, because nkp renders them into Kubernetes secrets. If the jump host reaches the internet through a proxy,
 # configure apt/dnf for it and export HTTP_PROXY/HTTPS_PROXY/NO_PROXY before running.
 
@@ -61,6 +67,8 @@ K8S_VERSION_HINT="1.36"
 DOCKERHUB_URL="https://registry-1.docker.io"
 NUTANIX_REGISTRY_DEFAULT_USER="svcregistrynkp"
 MIN_WORKERS=4  # two 4 vCPU workers (the documented Starter minimum) leave Kommander apps Pending on CPU
+NCR_PORT=5000
+HARBOR_DISK_GIB=100  # internal registry storage recommended by the NKP docs
 
 PACKAGE=""
 WORKDIR="${HOME}/nkp"
@@ -83,6 +91,13 @@ RESERVED_RANGES=""
 MGMT_CLUSTER_NAME=""
 MGMT_KCFG=""
 MGMT_K=()
+MGMT_USE_BUNDLE=N
+BUNDLE_DIR_ARG=""
+BUNDLE_ARGS=()
+BUNDLE_COUNT=0
+REGISTRY_MIRROR_ARGS=()
+NCR_URL=""
+NCR_AUTH=""
 
 if [[ -t 1 ]]; then
   C_B=$'\e[1m' C_G=$'\e[32m' C_Y=$'\e[33m' C_R=$'\e[31m' C_C=$'\e[36m' C_0=$'\e[0m'
@@ -107,6 +122,7 @@ parse_args() {
     case $1 in
       --package)      PACKAGE=${2:?--package needs a path}; shift ;;
       --workdir)      WORKDIR=${2:?--workdir needs a path}; shift ;;
+      --bundle-dir)   BUNDLE_DIR_ARG=${2:?--bundle-dir needs a directory}; shift ;;
       --prereqs-only) DO_SETUP=0 ;;
       --skip-prereqs) DO_PREREQS=0 ;;
       --print-only)   PRINT_ONLY=1 ;;
@@ -125,6 +141,10 @@ parse_args() {
     shift
   done
   [[ -z $PACKAGE ]] || PACKAGE=$(readlink -f "$PACKAGE")
+  if [[ -n $BUNDLE_DIR_ARG ]]; then
+    [[ -d $BUNDLE_DIR_ARG ]] || die "--bundle-dir: ${BUNDLE_DIR_ARG} is not a directory."
+    BUNDLE_DIR_ARG=$(readlink -f "$BUNDLE_DIR_ARG")
+  fi
   if [[ -n $CONFIG_FILE ]]; then
     [[ -r $CONFIG_FILE ]] || die "Cannot read the config file ${CONFIG_FILE}."
     CONFIG_FILE=$(readlink -f "$CONFIG_FILE")
@@ -168,7 +188,8 @@ init_config() {
   cat >"$f" <<'EOF'
 # NKP lab answers for nkp-jumphost-setup.sh --lab --config nkp-lab.env [--unattended]
 # Blank values fall back to the script's defaults or are discovered from Prism Central.
-# Passwords are never read from this file: export NUTANIX_PASSWORD and NUTANIX_REGISTRY_PASSWORD.
+# Passwords are never read from this file: export NUTANIX_PASSWORD and NUTANIX_REGISTRY_PASSWORD
+# (the registry token is optional when the bundle seeds the internal registry).
 
 # Management cluster
 CLUSTER_NAME=nkp-mgmt
@@ -201,6 +222,11 @@ PROXY_HTTPS=
 PROXY_NO=
 NTP_SERVERS=                      # blank = Prism Central's NTP servers
 ONBOARD_PC=Y
+
+# Images: seed the management cluster's internal registry from the extracted air-gapped bundle
+USE_BUNDLE=                       # Y | N; blank = Y when an extracted nkp-air-gapped-bundle is found
+BUNDLE_DIR=                       # blank = ~/nkp-dist/nkp-air-gapped-bundle_v2.19.*/nkp-v*/container-images
+USE_NDK_BUNDLE=N                  # Y also pushes ndk-*.tar (put it in BUNDLE_DIR); only if you deploy NDK
 
 # Lab network: DNS server VM and domain handed out by the subnet's DHCP
 LAB_DNS_VM=autoad
@@ -713,7 +739,8 @@ save_answers() {
     for k in CLUSTER_NAME WORKSPACE_NAMESPACE NUTANIX_ENDPOINT NUTANIX_USER TLS_MODE PC_CA_FILE NUTANIX_CLUSTER SUBNET NODE_CIDR \
              VM_IMAGE STORAGE_CONTAINER_NAME CONTROLPLANE_IP SERVICE_LB_IP_RANGE POD_CIDR SERVICE_CIDR SIZING \
              CP_REPLICAS CP_VCPUS CP_MEMORY WK_REPLICAS WK_VCPUS WK_MEMORY SSH_USERNAME SSH_PUBLIC_KEY \
-             USE_DOCKERHUB DOCKERHUB_USERNAME NUTANIX_REGISTRY_USERNAME USE_PROXY PROXY_HTTP PROXY_HTTPS PROXY_NO NTP_SERVERS ONBOARD_PC; do
+             USE_DOCKERHUB DOCKERHUB_USERNAME NUTANIX_REGISTRY_USERNAME USE_PROXY PROXY_HTTP PROXY_HTTPS PROXY_NO NTP_SERVERS ONBOARD_PC \
+             USE_BUNDLE BUNDLE_DIR USE_NDK_BUNDLE USE_MGMT_REGISTRY; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
   } >"$ANSWERS_FILE"
@@ -1316,6 +1343,80 @@ q_sizing() {
   fi
 }
 
+bundle_candidates() { # -> container-images directories of extracted air-gapped bundles for NKP_MINOR, newest first
+  local d
+  if [[ -n $PACKAGE && $(basename "$PACKAGE") == nkp-air-gapped-bundle_* ]]; then
+    d="${HOME}/nkp-dist/$(basename "$PACKAGE" .tar.gz)"
+    find "$d" -maxdepth 3 -type d -name container-images 2>/dev/null || true
+  fi
+  find "${HOME}/nkp-dist" -maxdepth 3 -type d -path "*/nkp-air-gapped-bundle_v${NKP_MINOR}.*/container-images" 2>/dev/null \
+    | sort -r || true
+}
+
+bundle_files() { # container-images dir -> comma-separated tars for --bundle; exit 1 with the reason when incomplete
+  local dir=$1 f name out=() ver_re="-v?${NKP_MINOR//./\\.}\.[0-9]+"
+  for name in konvoy-image-bundle kommander-image-bundle nkp-release-specs nutanix-product-catalog; do
+    f=$(find "$dir" -maxdepth 1 -type f -name "${name}-*.tar" 2>/dev/null | sort | awk 'END {print}')
+    if [[ -z $f ]]; then
+      if [[ $name == k* ]]; then echo "      ${dir} has no ${name}-*.tar." >&2; return 1; fi
+      continue
+    fi
+    if [[ ! $(basename "$f") =~ $ver_re ]]; then
+      echo "      $(basename "$f") is not an NKP ${NKP_MINOR} bundle." >&2; return 1
+    fi
+    out+=("$f")
+  done
+  if [[ ${USE_NDK_BUNDLE:-N} == Y ]]; then
+    f=$(find "$dir" -maxdepth 1 -type f -name 'ndk-*.tar' 2>/dev/null | sort | awk 'END {print}')
+    [[ -n $f ]] || { echo "      ${dir} has no ndk-*.tar; copy the NDK bundle there or answer No to NDK." >&2; return 1; }
+    out+=("$f")
+  fi
+  local IFS=,
+  printf '%s' "${out[*]}"
+}
+
+v_bundle_dir() {
+  [[ -d $1 ]] || { echo "      Not a directory: $1" >&2; return 1; }
+  bundle_files "$1" >/dev/null
+}
+
+q_bundle() { # management cluster: seed its internal registry (NCR) from the air-gapped bundle
+  BUNDLE_ARGS=() BUNDLE_COUNT=0
+  if [[ -n $BUNDLE_DIR_ARG ]]; then BUNDLE_DIR=$BUNDLE_DIR_ARG USE_BUNDLE=Y; fi
+  if [[ ${USE_BUNDLE:-} == N ]]; then info "Image bundle: not used (USE_BUNDLE=N); images come from the internet."; return 0; fi
+  if [[ -z ${BUNDLE_DIR:-} || ! -d $BUNDLE_DIR ]]; then BUNDLE_DIR=$(bundle_candidates | awk 'NR == 1'); fi
+  if [[ -z $BUNDLE_DIR && ${USE_BUNDLE:-} != Y ]]; then
+    info "No extracted air-gapped bundle under ${HOME}/nkp-dist: images come from the internet (Docker Hub)."
+    info "For a local registry, download nkp-air-gapped-bundle_v${NKP_MINOR}.x and rerun with --package (or --bundle-dir)."
+    USE_BUNDLE=N
+    return 0
+  fi
+  step "Image bundle (internal registry)"
+  if [[ $(nkp create cluster nutanix --help 2>&1 || true) != *--bundle* ]]; then
+    ((!UNATTENDED)) || [[ ${USE_BUNDLE:-} != Y ]] || die "--unattended: USE_BUNDLE=Y, but this nkp CLI has no --bundle option."
+    warn "This nkp CLI has no --bundle option; images come from the internet."
+    USE_BUNDLE=N
+    return 0
+  fi
+  info "NKP pushes the bundle's images into ${CLUSTER_NAME}'s internal registry (Harbor, namespace ncr-system),"
+  info "and workload clusters can then pull from it instead of Docker Hub. Images outside the bundle still come from the internet."
+  if ! ask_yn "Seed the internal registry from the bundle?" "${USE_BUNDLE:-Y}"; then USE_BUNDLE=N; return 0; fi
+  USE_BUNDLE=Y
+  if ask_yn "Also push the NDK catalog bundle (ndk-*.tar; only if you will deploy NDK)?" "${USE_NDK_BUNDLE:-N}"; then
+    USE_NDK_BUNDLE=Y
+  else
+    USE_NDK_BUNDLE=N
+  fi
+  ask BUNDLE_DIR "Bundle directory (container-images)" v_bundle_dir
+  BUNDLE_DIR=$(readlink -f "$BUNDLE_DIR")
+  local files f parts names=()
+  files=$(bundle_files "$BUNDLE_DIR")
+  IFS=, read -r -a parts <<<"$files"
+  for f in "${parts[@]}"; do names+=("$(basename "$f")"); done
+  BUNDLE_ARGS=(--bundle="$files") BUNDLE_COUNT=${#parts[@]}
+  ok "Bundle: ${names[*]}"
+}
+
 q_access() {
   step "Node SSH access"
   SSH_USERNAME=${SSH_USERNAME:-nkpadmin}
@@ -1332,26 +1433,33 @@ q_access() {
   fi
   ask SSH_PUBLIC_KEY "SSH public key file" v_file
 
-  # A connected --self-managed cluster without a registry mirror requires these.
+  # A connected --self-managed cluster without a registry mirror requires these; with the bundle they are optional.
   NUTANIX_REGISTRY_ARGS=()
-  local create_help
+  local create_help tok=N
   create_help=$(nkp create cluster nutanix --help 2>&1 || true)
   if ((WORKLOAD)); then
     info "Nutanix registry: workload clusters inherit the access token from ${MGMT_CLUSTER_NAME}."
   elif [[ $create_help == *--nutanix-registry-username* ]]; then
-    step "Nutanix registry (required)"
-    info "NKP pulls its images with a Docker Hub service account issued on the Nutanix Portal."
-    info "Portal: NKP download page > generate an access token (the page shows: docker login --username svcregistrynkp)."
-    NUTANIX_REGISTRY_USERNAME=${NUTANIX_REGISTRY_USERNAME:-$NUTANIX_REGISTRY_DEFAULT_USER}
-    ask_registry_login NUTANIX_REGISTRY_USERNAME NUTANIX_REGISTRY_PASSWORD "Nutanix registry" "Access token from the Nutanix Portal"
-    NUTANIX_REGISTRY_ARGS=(--nutanix-registry-username="$NUTANIX_REGISTRY_USERNAME"
-                           --nutanix-registry-password="$NUTANIX_REGISTRY_PASSWORD")
+    if ((${#BUNDLE_ARGS[@]})); then
+      step "Nutanix registry (optional: the bundle seeds the internal registry)"
+      if [[ -n ${NUTANIX_REGISTRY_PASSWORD:-} ]]; then tok=Y; fi
+    else
+      step "Nutanix registry (required)"
+    fi
+    if ((${#BUNDLE_ARGS[@]} == 0)) || ask_yn "Also provide the Nutanix Docker Hub token (for images outside the bundle)?" "$tok"; then
+      info "NKP pulls its images with a Docker Hub service account issued on the Nutanix Portal."
+      info "Portal: NKP download page > generate an access token (the page shows: docker login --username svcregistrynkp)."
+      NUTANIX_REGISTRY_USERNAME=${NUTANIX_REGISTRY_USERNAME:-$NUTANIX_REGISTRY_DEFAULT_USER}
+      ask_registry_login NUTANIX_REGISTRY_USERNAME NUTANIX_REGISTRY_PASSWORD "Nutanix registry" "Access token from the Nutanix Portal"
+      NUTANIX_REGISTRY_ARGS=(--nutanix-registry-username="$NUTANIX_REGISTRY_USERNAME"
+                             --nutanix-registry-password="$NUTANIX_REGISTRY_PASSWORD")
+    fi
   fi
 
   step "Your own Docker Hub account (optional)"
   info "Separate from the Nutanix registry token above. Only needed to lift Docker Hub pull limits for other images."
   local def=Y
-  if ((${#NUTANIX_REGISTRY_ARGS[@]})); then def=N; fi
+  if ((${#NUTANIX_REGISTRY_ARGS[@]} || ${#BUNDLE_ARGS[@]} || ${#REGISTRY_MIRROR_ARGS[@]})); then def=N; fi
   if ask_yn "Provide your own Docker Hub credentials?" "${USE_DOCKERHUB:-$def}"; then
     USE_DOCKERHUB=Y
     ask_registry_login DOCKERHUB_USERNAME DOCKERHUB_PASSWORD "Docker Hub" "Docker Hub password or access token"
@@ -1437,6 +1545,8 @@ sizing_need() { # -> "nodes vcpus memory_gib" for the current SIZING values
 capacity_check() { # nodes vcpus memory_gib: everything this run will create on NUTANIX_CLUSTER
   step "Capacity of ${NUTANIX_CLUSTER}"
   local nodes=$1 vcpus=$2 mem=$3 disk=$(($1 * NODE_DISK_GIB)) line nhosts="" cores=0 hmem=0 vm_cpu=0 vm_mem=0 cvm free usable sc cap
+  local registry=""
+  if ((${#BUNDLE_ARGS[@]})); then disk=$((disk + HARBOR_DISK_GIB)) registry=" (incl. ${HARBOR_DISK_GIB} GiB for the internal registry)"; fi
   if ((!PC_API_OK)) || [[ -z ${PE_UUID:-} ]]; then warn "Prism Central API not available; skipping the capacity check."; return 0; fi
   line=$(pc_api GET "/api/clustermgmt/v4.0/config/clusters/${PE_UUID}/hosts" 2>/dev/null \
     | jq -r '[.data[]?] | "\(length) \(map(.numberOfCpuCores // 0) | add // 0) \(map(.memorySizeBytes // 0) | add // 0 | ./1073741824 | floor)"' \
@@ -1460,7 +1570,7 @@ capacity_check() { # nodes vcpus memory_gib: everything this run will create on 
   usable=$((free * 90 / 100))
   row "Hosts" "${nhosts}: ${cores} cores, ${hmem} GiB memory"
   row "Running VMs" "${vm_cpu:-0} vCPU, ${vm_mem:-0} GiB (CVMs about ${cvm} GiB)"
-  row "NKP adds" "${nodes} VMs: ${vcpus} vCPU, ${mem} GiB memory, ${disk} GiB disk"
+  row "NKP adds" "${nodes} VMs: ${vcpus} vCPU, ${mem} GiB memory, ${disk} GiB disk${registry}"
   if ((cores > 0 && ${vm_cpu:-0} + vcpus > cores * 4)); then
     warn "vCPU overcommit would be $(((${vm_cpu:-0} + vcpus) / cores)):1, above 4:1. Expect slow platform applications."
   fi
@@ -1471,9 +1581,9 @@ capacity_check() { # nodes vcpus memory_gib: everything this run will create on 
   if [[ -n $sc ]]; then
     cap=$(storage_free_gib "$sc")
     if [[ -n $cap ]] && ((disk > cap)); then
-      warn "Storage container ${STORAGE_CONTAINER_NAME} has about ${cap} GiB free; NKP node disks take up to ${disk} GiB (thin provisioned)."
+      warn "Storage container ${STORAGE_CONTAINER_NAME} has about ${cap} GiB free; NKP takes up to ${disk} GiB${registry} (thin provisioned)."
     elif [[ -n $cap ]]; then
-      ok "Storage: ${disk} GiB of node disks, about ${cap} GiB free in ${STORAGE_CONTAINER_NAME}"
+      ok "Storage: ${disk} GiB${registry}, about ${cap} GiB free in ${STORAGE_CONTAINER_NAME}"
     fi
   fi
   if ((mem > usable)); then
@@ -1495,6 +1605,9 @@ storage_free_gib() { # storage container JSON (v4) -> free GiB, from its stats w
 }
 
 build_command() {
+  if ((${#BUNDLE_ARGS[@]} && ${#REGISTRY_MIRROR_ARGS[@]})); then
+    die "--bundle and --registry-mirror-* cannot be combined (NKP ${NKP_MINOR} docs)."
+  fi
   CMD=(nkp create cluster nutanix)
   if ((WORKLOAD)); then
     CMD+=(--namespace="$WORKSPACE_NAMESPACE" --kubeconfig="$MGMT_KCFG")
@@ -1520,7 +1633,9 @@ build_command() {
     --ssh-public-key-file="$SSH_PUBLIC_KEY"
     --timeout=60m
     "${SIZING_ARGS[@]}"
-    "${NUTANIX_REGISTRY_ARGS[@]}")
+    "${NUTANIX_REGISTRY_ARGS[@]}"
+    "${BUNDLE_ARGS[@]}"
+    "${REGISTRY_MIRROR_ARGS[@]}")
   if [[ $USE_DOCKERHUB == Y ]]; then
     CMD+=(--registry-url="$DOCKERHUB_URL" --registry-username="$DOCKERHUB_USERNAME" --registry-password="$DOCKERHUB_PASSWORD")
   fi
@@ -1537,6 +1652,7 @@ redacted_command() {
     case $a in
       --registry-password=*) out+=("--registry-password=********") ;;
       --nutanix-registry-password=*) out+=("--nutanix-registry-password=********") ;;
+      --registry-mirror-password=*) out+=("--registry-mirror-password=********") ;;
       --additional-trust-bundle=*) ((${#a} > 200)) && out+=("--additional-trust-bundle=<base64 Prism Central certificate>") || out+=("$a") ;;
       *) out+=("$a") ;;
     esac
@@ -1571,6 +1687,13 @@ show_summary() {
   row "Pod / service CIDR" "$POD_CIDR / $SERVICE_CIDR"
   row "Sizing" "$SIZING"
   row "SSH" "$SSH_USERNAME, key $SSH_PUBLIC_KEY"
+  if ((${#BUNDLE_ARGS[@]})); then
+    row "Images" "bundle (${BUNDLE_COUNT} files from ${BUNDLE_DIR}) -> internal registry"
+  elif ((${#REGISTRY_MIRROR_ARGS[@]})); then
+    row "Images" "${MGMT_CLUSTER_NAME} internal registry ${NCR_URL} (${NCR_AUTH})"
+  else
+    row "Images" "internet (Docker Hub)"
+  fi
   row "Docker Hub credentials" "$hub"
   if ((${#NUTANIX_REGISTRY_ARGS[@]})); then row "Nutanix registry user" "$NUTANIX_REGISTRY_USERNAME"; fi
   row "Proxy" "$proxy"
@@ -1666,6 +1789,10 @@ phase_status() {
   info "Clusters in NKP workspaces (workload clusters show Joined once attached):"
   kubectl --kubeconfig "$kcfg" get nkpclusters -A >&2 2>/dev/null || true
   nkp get dashboard --kubeconfig="$kcfg" 2>/dev/null || true
+  local url
+  if url=$(ncr_url "$kcfg"); then
+    info "Internal registry: ${url} (user admin; password: $(ncr_password_cmd "$kcfg"))"
+  fi
   if write_lab_summary; then info "Lab summary: ${WORKDIR}/lab-summary.txt"; fi
 }
 
@@ -1677,7 +1804,7 @@ write_lab_summary() { # -> ${WORKDIR}/lab-summary.txt, mode 600 (it holds the da
   (
     # shellcheck disable=SC1090,SC1091
     . "${WORKDIR}/nkp-install.env"
-    m=$CLUSTER_NAME mk="${WORKDIR}/${CLUSTER_NAME}/${CLUSTER_NAME}.conf"
+    m=$CLUSTER_NAME mk="${WORKDIR}/${CLUSTER_NAME}/${CLUSTER_NAME}.conf" url=""
     printf 'NKP %s lab, summary written %s\n\n' "$NKP_MINOR" "$(date '+%F %T')"
     printf '%-22s %s (user %s)\n' "Prism Central" "$NUTANIX_ENDPOINT" "$NUTANIX_USER"
     printf '%-22s %s\n' "Prism Element" "$NUTANIX_CLUSTER" "Subnet" "${SUBNET}${NODE_CIDR:+ (${NODE_CIDR})}"
@@ -1692,6 +1819,12 @@ write_lab_summary() { # -> ${WORKDIR}/lab-summary.txt, mode 600 (it holds the da
     if [[ -f $mk ]]; then
       printf '  Dashboard\n'
       nkp get dashboard --kubeconfig="$mk" 2>/dev/null | sed 's/^/    /' || echo "    (not available yet: nkp get dashboard --kubeconfig=${mk})"
+      if url=$(ncr_url "$mk"); then
+        seeded=""
+        if [[ ${USE_BUNDLE:-} == Y ]]; then seeded=", seeded from the bundle"; fi
+        printf '  %-20s %s\n' "Internal registry" "${url} (user admin${seeded})"
+        printf '    password: %s\n' "$(ncr_password_cmd "$mk")"
+      fi
     fi
     if [[ -f ${WORKDIR}/nkp-workload.env ]]; then
       # shellcheck disable=SC1090,SC1091
@@ -1699,6 +1832,9 @@ write_lab_summary() { # -> ${WORKDIR}/lab-summary.txt, mode 600 (it holds the da
       printf '\nWorkload cluster       %s (workspace %s)\n' "$CLUSTER_NAME" "$WORKSPACE_NAMESPACE"
       printf '  %-20s %s\n' "API endpoint" "https://${CONTROLPLANE_IP}:6443" "Load balancer range" "$SERVICE_LB_IP_RANGE" \
         "Kubeconfig" "${WORKDIR}/${CLUSTER_NAME}/${CLUSTER_NAME}.conf"
+      if [[ ${USE_MGMT_REGISTRY:-} == Y ]]; then
+        printf '  %-20s %s\n' "Images" "from ${m}'s internal registry${url:+ (${url})}"
+      fi
       if [[ -f $mk ]]; then
         printf '  %-20s %s\n' "State" "$(kubectl --kubeconfig "$mk" -n "$WORKSPACE_NAMESPACE" get nkpclusters "$CLUSTER_NAME" --no-headers 2>/dev/null || echo unknown)"
       fi
@@ -1815,6 +1951,7 @@ phase_setup() {
   ensure_docker_access
   ensure_tmux_session
   PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NUTANIX_REGISTRY_ARGS=() NODE_CIDR="" NODE_POOLS=""
+  BUNDLE_ARGS=() REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
   load_answers
   q_cluster
   q_prism_central
@@ -1822,6 +1959,7 @@ phase_setup() {
   lab_network
   q_network
   q_sizing
+  q_bundle
   q_access
   q_extras
   save_answers
@@ -1870,6 +2008,7 @@ phase_lab() {
   ensure_docker_access
   ensure_tmux_session
   PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NUTANIX_REGISTRY_ARGS=() NODE_CIDR="" NODE_POOLS=""
+  BUNDLE_ARGS=() REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
   load_answers
   q_cluster
   q_prism_central
@@ -1877,6 +2016,7 @@ phase_lab() {
   lab_network
   q_network
   q_sizing
+  q_bundle
   q_access
   q_extras
   save_answers
@@ -1922,7 +2062,7 @@ load_mgmt_context() {
   [[ -f $f ]] || die "No management cluster answers at ${f}. Create the management cluster first, or pass --workdir."
   # shellcheck disable=SC1090
   . "$f"
-  MGMT_CLUSTER_NAME=$CLUSTER_NAME
+  MGMT_CLUSTER_NAME=$CLUSTER_NAME MGMT_USE_BUNDLE=${USE_BUNDLE:-N}
   MGMT_KCFG="${WORKDIR}/${MGMT_CLUSTER_NAME}/${MGMT_CLUSTER_NAME}.conf"
   [[ -f $MGMT_KCFG ]] || die "No kubeconfig for ${MGMT_CLUSTER_NAME} at ${MGMT_KCFG}."
   MGMT_K=(kubectl --kubeconfig "$MGMT_KCFG")
@@ -1943,6 +2083,107 @@ load_mgmt_context() {
   if [[ -n ${SERVICE_LB_IP_RANGE:-} ]]; then RESERVED_RANGES+="${RESERVED_RANGES:+,}${SERVICE_LB_IP_RANGE}"; fi
   RESERVED_RANGES=$(tr ',' '\n' <<<"$RESERVED_RANGES" | awk 'NF && !seen[$0]++' | paste -sd, - || true)
   [[ -z $RESERVED_RANGES ]] || info "Addresses already used by NKP clusters: ${RESERVED_RANGES}"
+}
+
+ncr_url() { # management kubeconfig -> https://<ingress address>:5000 when the internal registry (ncr-system) exists
+  local k=(kubectl --kubeconfig "$1") host
+  "${k[@]}" -n ncr-system get secret harbor-admin-password >/dev/null 2>&1 || return 1
+  host=$("${k[@]}" -n kommander get kommanderclusters -l kommander.d2iq.io/host=true \
+    -o jsonpath='{.items[0].status.ingress.address}' 2>/dev/null || true)
+  [[ -n $host ]] || return 1
+  printf 'https://%s:%s' "$host" "$NCR_PORT"
+}
+
+ncr_password_cmd() { # management kubeconfig -> the command that prints the Harbor admin password
+  printf "kubectl --kubeconfig %s -n ncr-system get secret harbor-admin-password -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d" "$1"
+}
+
+harbor_api() { # METHOD PATH [JSON]: Harbor API of the internal registry as admin
+  local extra=()
+  if [[ -n ${3-} ]]; then extra=(-H 'Content-Type: application/json' --data "$3"); fi
+  printf 'user = "admin:%s"\n' "$(cfg_escape "$NCR_ADMIN_PASSWORD")" \
+    | curl -K - -sS --fail --max-time 30 --cacert "$NCR_CACERT" -H 'Accept: application/json' \
+        -X "$1" "${extra[@]}" "${NCR_URL}/api/v2.0$2"
+}
+
+ncr_robot() { # name -> "user secret" of a new pull-only robot account on every project; replaces one with that name
+  local name=$1 id body out
+  while read -r id; do
+    [[ -z $id ]] || harbor_api DELETE "/robots/${id}" >/dev/null || true
+  done < <(harbor_api GET '/robots?page_size=100' 2>/dev/null \
+    | jq -r --arg n "$name" '.[]? | select(.name == $n or (.name | endswith("$" + $n))) | .id' 2>/dev/null || true)
+  body=$(jq -nc --arg n "$name" --arg d "Pull-only access for NKP workload cluster ${CLUSTER_NAME}" \
+    '{name: $n, description: $d, level: "system", duration: -1, disable: false,
+      permissions: [{kind: "project", namespace: "*", access: [{resource: "repository", action: "pull"}]}]}')
+  out=$(harbor_api POST /robots "$body" 2>/dev/null) || return 1
+  jq -er '"\(.name) \(.secret)"' <<<"$out" 2>/dev/null
+}
+
+q_mgmt_registry() { # workload cluster: pull images through the management cluster's internal registry
+  REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
+  local def=${USE_MGMT_REGISTRY:-$MGMT_USE_BUNDLE} ca projects robot user="" pass=""
+  [[ $def == Y ]] || def=N
+  if ! NCR_URL=$(ncr_url "$MGMT_KCFG"); then
+    NCR_URL=""
+    info "Images: ${MGMT_CLUSTER_NAME} has no internal registry (ncr-system); ${CLUSTER_NAME} pulls from the internet."
+    USE_MGMT_REGISTRY=N
+    return 0
+  fi
+  step "Images"
+  if [[ $(nkp create cluster nutanix --help 2>&1 || true) != *--registry-mirror-url* ]]; then
+    warn "This nkp CLI has no --registry-mirror-url option; ${CLUSTER_NAME} pulls from the internet."
+    USE_MGMT_REGISTRY=N NCR_URL=""
+    return 0
+  fi
+  if [[ $MGMT_USE_BUNDLE != Y ]]; then
+    info "${MGMT_CLUSTER_NAME} was not seeded from the bundle, so its internal registry may not hold the NKP images."
+  fi
+  if ! ask_yn "Pull ${CLUSTER_NAME}'s images from ${MGMT_CLUSTER_NAME}'s internal registry (${NCR_URL}) instead of Docker Hub?" "$def"; then
+    USE_MGMT_REGISTRY=N NCR_URL=""
+    return 0
+  fi
+  USE_MGMT_REGISTRY=Y
+  ca=$("${MGMT_K[@]}" -n kommander get kommanderclusters -l kommander.d2iq.io/host=true \
+    -o jsonpath='{.items[0].status.ingress.caBundle}' 2>/dev/null || true)
+  if [[ -z $ca ]]; then
+    ca=$("${MGMT_K[@]}" -n kommander get nkpclusters -l kommander.d2iq.io/host=true \
+      -o jsonpath='{.items[0].kommanderCluster.status.ingress.caBundle}' 2>/dev/null || true)
+  fi
+  [[ -n $ca ]] || die "Cannot read the ingress CA of ${MGMT_CLUSTER_NAME} (kommandercluster status). Try: ${SCRIPT_PATH} --status"
+  NCR_CACERT="${CLUSTER_DIR}/ncr-ca.pem"
+  (umask 077 && base64 -d <<<"$ca" >"$NCR_CACERT") 2>/dev/null || die "The ingress CA of ${MGMT_CLUSTER_NAME} is not valid base64."
+  chmod 600 "$NCR_CACERT"
+  grep -q 'BEGIN CERTIFICATE' "$NCR_CACERT" || die "The ingress CA of ${MGMT_CLUSTER_NAME} is not a PEM certificate."
+  if curl -sS -o /dev/null --max-time 15 --cacert "$NCR_CACERT" "${NCR_URL}/v2/" 2>/dev/null; then
+    ok "${NCR_URL} answers and its certificate matches the CA (${NCR_CACERT})"
+  else
+    warn "${NCR_URL} does not answer from this host with that CA; the nodes may still reach it."
+  fi
+
+  NCR_ADMIN_PASSWORD=$("${MGMT_K[@]}" -n ncr-system get secret harbor-admin-password \
+    -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  [[ -n $NCR_ADMIN_PASSWORD ]] || die "Cannot read the Harbor admin password from ${MGMT_CLUSTER_NAME} (ncr-system/harbor-admin-password)."
+  if projects=$(harbor_api GET '/projects?page_size=100' 2>/dev/null) \
+     && jq -e 'length > 0 and all(.[]; .metadata.public == "true")' <<<"$projects" >/dev/null 2>&1; then
+    NCR_AUTH=anonymous
+    ok "Every project in the internal registry is public; ${CLUSTER_NAME} pulls without credentials."
+  elif [[ -n ${projects:-} ]] && robot=$(ncr_robot "nkp-${CLUSTER_NAME#nkp-}"); then
+    read -r user pass <<<"$robot"
+    NCR_AUTH="robot ${user}"
+    ok "Created pull-only robot account ${user} for ${CLUSTER_NAME}"
+  else
+    warn "The Harbor API at ${NCR_URL} did not answer as expected; a robot account could not be created."
+    if ! ask_yn "Let ${CLUSTER_NAME} pull with the Harbor admin account instead?" Y; then
+      USE_MGMT_REGISTRY=N NCR_URL=""
+      info "${CLUSTER_NAME} pulls its images from the internet."
+      return 0
+    fi
+    user=admin pass=$NCR_ADMIN_PASSWORD NCR_AUTH=admin
+  fi
+  REGISTRY_MIRROR_ARGS=(--registry-mirror-url="$NCR_URL" --registry-mirror-cacert="$NCR_CACERT")
+  if [[ $NCR_AUTH != anonymous ]]; then
+    REGISTRY_MIRROR_ARGS+=(--registry-mirror-username="$user" --registry-mirror-password="$pass")
+  fi
 }
 
 q_workspace() {
@@ -2046,6 +2287,7 @@ phase_workload() {
   ensure_docker_access
   ensure_tmux_session
   PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NUTANIX_REGISTRY_ARGS=() NODE_CIDR="" NODE_POOLS=""
+  BUNDLE_ARGS=() REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
   load_mgmt_context
   CLUSTER_NAME="" CONTROLPLANE_IP="" SERVICE_LB_IP_RANGE=""
   ANSWERS_FILE="${WORKDIR}/nkp-workload.env"
@@ -2065,6 +2307,7 @@ phase_workload() {
   q_inventory
   q_network
   q_sizing
+  q_mgmt_registry
   q_access
   q_extras
   save_answers
