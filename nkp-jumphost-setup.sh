@@ -40,6 +40,7 @@ KUBECTL_FALLBACK="v1.35.2"
 K8S_VERSION_HINT="1.35"
 DOCKERHUB_URL="https://registry-1.docker.io"
 NUTANIX_REGISTRY_DEFAULT_USER="svcregistrynkp"
+MIN_WORKERS=4  # two 4 vCPU workers (the documented Starter minimum) leave Kommander apps Pending on CPU
 
 PACKAGE=""
 WORKDIR="${HOME}/nkp"
@@ -208,6 +209,10 @@ v_ip()    { ipcalc ip "$1"    || { echo "      Not a valid IP address." >&2; ret
 v_cidr()  { ipcalc cidr "$1"  || { echo "      Use CIDR notation, for example 192.168.0.0/16." >&2; return 1; }; }
 v_range() { ipcalc range "$1" || { echo "      Use first-last, for example 10.0.0.150-10.0.0.160." >&2; return 1; }; }
 v_int()   { [[ $1 =~ ^[1-9][0-9]*$ ]] || { echo "      Enter a positive whole number." >&2; return 1; }; }
+v_workers() {
+  if [[ $1 =~ ^[1-9][0-9]*$ ]] && (($1 >= MIN_WORKERS)); then return 0; fi
+  echo "      Use at least ${MIN_WORKERS} workers." >&2; return 1
+}
 v_cp_replicas() { [[ $1 =~ ^[135]$ ]] || { echo "      Use 1, 3 or 5 (3 for production)." >&2; return 1; }; }
 v_file()  { [[ -r $1 ]] || { echo "      File not found or not readable: $1" >&2; return 1; }; }
 v_endpoint() {
@@ -787,26 +792,26 @@ q_sizing() {
   step "Node sizing"
   local vals=(pro starter custom)
   local labels=("Pro/Ultimate default: 3 control plane (4 vCPU, 16 GiB) + 4 workers (8 vCPU, 32 GiB)"
-                "Starter minimum: 3 control plane (2 vCPU, 8 GiB) + 2 workers (4 vCPU, 8 GiB)"
-                "Custom")
+                "Starter: 3 control plane (2 vCPU, 8 GiB) + ${MIN_WORKERS} workers (4 vCPU, 8 GiB)"
+                "Custom (at least ${MIN_WORKERS} workers)")
   SIZING=${SIZING:-pro}
   pick SIZING "Choose a size" vals labels
   SIZING_ARGS=()
   case $SIZING in
     starter)
-      SIZING_ARGS=(--control-plane-vcpus=2 --control-plane-memory=8 --worker-replicas=2 --worker-vcpus=4 --worker-memory=8)
-      warn "Two workers cannot run the extra Pro/Ultimate platform apps if you upgrade the license later." ;;
+      SIZING_ARGS=(--control-plane-vcpus=2 --control-plane-memory=8 --worker-replicas="$MIN_WORKERS" --worker-vcpus=4 --worker-memory=8)
+      warn "4 vCPU / 8 GiB workers cannot run the extra Pro/Ultimate platform apps if you upgrade the license later." ;;
     custom)
       CP_REPLICAS=${CP_REPLICAS:-3} CP_VCPUS=${CP_VCPUS:-4} CP_MEMORY=${CP_MEMORY:-16}
-      WK_REPLICAS=${WK_REPLICAS:-4} WK_VCPUS=${WK_VCPUS:-8} WK_MEMORY=${WK_MEMORY:-32}
+      WK_REPLICAS=${WK_REPLICAS:-$MIN_WORKERS} WK_VCPUS=${WK_VCPUS:-8} WK_MEMORY=${WK_MEMORY:-32}
+      if ((10#$WK_REPLICAS < MIN_WORKERS)); then WK_REPLICAS=$MIN_WORKERS; fi
       ask CP_REPLICAS "Control plane nodes (1, 3 or 5)" v_cp_replicas
       ask CP_VCPUS "Control plane vCPUs per node" v_int
       ask CP_MEMORY "Control plane memory per node (GiB)" v_int
-      ask WK_REPLICAS "Worker nodes" v_int
+      ask WK_REPLICAS "Worker nodes (at least ${MIN_WORKERS})" v_workers
       ask WK_VCPUS "Worker vCPUs per node" v_int
       ask WK_MEMORY "Worker memory per node (GiB)" v_int
       ((CP_REPLICAS >= 3)) || warn "A single control plane node means losing the node loses the cluster."
-      ((WK_REPLICAS >= 4)) || warn "Fewer than 4 workers: rook-ceph (logging, Velero, Insights) upgrades need 4."
       SIZING_ARGS=(--control-plane-replicas="$CP_REPLICAS" --control-plane-vcpus="$CP_VCPUS" --control-plane-memory="$CP_MEMORY"
                    --worker-replicas="$WK_REPLICAS" --worker-vcpus="$WK_VCPUS" --worker-memory="$WK_MEMORY") ;;
   esac
@@ -1023,7 +1028,14 @@ cluster_status() { # kubeconfig
   if [[ $(wc -l <<<"$out") -le 1 ]]; then ok "All platform applications are ready"
   else info "Platform applications not ready:"; printf '%s\n' "$out" >&2; fi
   out=$("${k[@]}" get pods -A 2>&1 | awk 'NR == 1 || ($4 != "Running" && $4 != "Completed") || $3 ~ /^0\//' || true)
-  if [[ $(wc -l <<<"$out") -gt 1 ]]; then info "Pods not running or not ready:"; printf '%s\n' "$out" >&2; fi
+  if [[ $(wc -l <<<"$out") -gt 1 ]]; then
+    info "Pods not running or not ready:"; printf '%s\n' "$out" >&2
+    if [[ $out == *Pending* ]]; then
+      info "Pending pods with 'Insufficient cpu/memory' events below need more workers. List and scale the pool with:"
+      info "  nkp get nodepools --cluster-name=${CLUSTER_NAME} -n kommander --kubeconfig=${1}"
+      info "  nkp scale nodepools md-0 --replicas=<n> --cluster-name=${CLUSTER_NAME} -n kommander --kubeconfig=${1}"
+    fi
+  fi
   info "Load balancer services (the ingress needs an EXTERNAL-IP from the service IP range):"
   "${k[@]}" get svc -A 2>&1 | awk 'NR == 1 || /LoadBalancer/' >&2 || true
   info "Recent warning events:"
