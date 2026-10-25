@@ -6,9 +6,14 @@
 # Phase 2 relaunches itself inside a tmux session named "nkp" (if you are not already in one),
 #         asks for the Prism Central details interactively, validates them, runs the NKP
 #         preflight checks, then runs `nkp create cluster nutanix --self-managed`.
+# --workload then creates workload (managed) clusters from that management cluster: it reuses the
+#         management answers as defaults, picks or creates a workspace, checks that the control plane IP
+#         and load balancer range are not used by another NKP cluster, and waits until the cluster
+#         has joined the workspace and its platform applications are ready.
 #
 # Usage:
 #   ./nkp-jumphost-setup.sh [--package nkp-bundle_v2.18.x_linux_amd64.tar.gz] [options]
+#   ./nkp-jumphost-setup.sh --workload
 #
 # Options:
 #   --package PATH    NKP package from the Nutanix Portal (nkp_*, nkp-bundle_* or
@@ -20,6 +25,8 @@
 #   --print-only      Do everything except the final cluster creation; print the command.
 #   --insecure        Do not verify Prism Central's TLS certificate, without asking.
 #   --status          Show what is still not ready on a cluster this script already created.
+#   --workload        Create a workload (managed) cluster on the management cluster this script
+#                     created: it attaches to a workspace you choose. Run after the management cluster is up.
 #   -h, --help        Show this help.
 #
 # Passwords are not saved in the answers file; to skip their prompts, export NUTANIX_PASSWORD,
@@ -49,6 +56,12 @@ DO_SETUP=1
 PRINT_ONLY=0
 FORCE_INSECURE=0
 STATUS_ONLY=0
+WORKLOAD=0
+WORKSPACE_NAMESPACE=""
+RESERVED_RANGES=""
+MGMT_CLUSTER_NAME=""
+MGMT_KCFG=""
+MGMT_K=()
 
 if [[ -t 1 ]]; then
   C_B=$'\e[1m' C_G=$'\e[32m' C_Y=$'\e[33m' C_R=$'\e[31m' C_C=$'\e[36m' C_0=$'\e[0m'
@@ -78,6 +91,7 @@ parse_args() {
       --print-only)   PRINT_ONLY=1 ;;
       --insecure)     FORCE_INSECURE=1 ;;
       --status)       STATUS_ONLY=1 ;;
+      --workload)     WORKLOAD=1 TMUX_SESSION=nkp-workload ;;
       -h|--help)      usage; exit 0 ;;
       *)              die "Unknown option: $1 (see --help)" ;;
     esac
@@ -212,6 +226,11 @@ v_int()   { [[ $1 =~ ^[1-9][0-9]*$ ]] || { echo "      Enter a positive whole nu
 v_workers() {
   if [[ $1 =~ ^[1-9][0-9]*$ ]] && (($1 >= MIN_WORKERS)); then return 0; fi
   echo "      Use at least ${MIN_WORKERS} workers." >&2; return 1
+}
+v_dns_label() {
+  if [[ $1 =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] && ((${#1} <= 63)); then return 0; fi
+  echo "      Use lowercase letters, digits and '-', starting and ending with a letter or digit, max 63 characters." >&2
+  return 1
 }
 v_cp_replicas() { [[ $1 =~ ^[135]$ ]] || { echo "      Use 1, 3 or 5 (3 for production)." >&2; return 1; }; }
 v_file()  { [[ -r $1 ]] || { echo "      File not found or not readable: $1" >&2; return 1; }; }
@@ -521,7 +540,7 @@ save_answers() {
   local k
   {
     echo "# NKP installer answers (no secrets). Generated $(date -Is)."
-    for k in CLUSTER_NAME NUTANIX_ENDPOINT NUTANIX_USER TLS_MODE PC_CA_FILE NUTANIX_CLUSTER SUBNET NODE_CIDR \
+    for k in CLUSTER_NAME WORKSPACE_NAMESPACE NUTANIX_ENDPOINT NUTANIX_USER TLS_MODE PC_CA_FILE NUTANIX_CLUSTER SUBNET NODE_CIDR \
              VM_IMAGE STORAGE_CONTAINER_NAME CONTROLPLANE_IP SERVICE_LB_IP_RANGE POD_CIDR SERVICE_CIDR SIZING \
              CP_REPLICAS CP_VCPUS CP_MEMORY WK_REPLICAS WK_VCPUS WK_MEMORY SSH_USERNAME SSH_PUBLIC_KEY \
              USE_DOCKERHUB DOCKERHUB_USERNAME NUTANIX_REGISTRY_USERNAME USE_PROXY PROXY_HTTP PROXY_HTTPS PROXY_NO NTP_SERVERS ONBOARD_PC; do
@@ -531,10 +550,25 @@ save_answers() {
   chmod 600 "$ANSWERS_FILE"
 }
 
+v_workload_name() {
+  v_cluster_name "$1" || return 1
+  if [[ $1 == "$MGMT_CLUSTER_NAME" ]]; then echo "      That is the management cluster's name." >&2; return 1; fi
+  local names
+  names=$("${MGMT_K[@]}" get clusters.cluster.x-k8s.io -A -o name 2>/dev/null || true)
+  if grep -qx "cluster.cluster.x-k8s.io/$1" <<<"$names"; then
+    echo "      A cluster named $1 already exists on ${MGMT_CLUSTER_NAME}." >&2; return 1
+  fi
+}
+
 q_cluster() {
   step "Cluster name"
-  CLUSTER_NAME=${CLUSTER_NAME:-nkp-mgmt}
-  ask CLUSTER_NAME "Management cluster name" v_cluster_name
+  if ((WORKLOAD)); then
+    CLUSTER_NAME=${CLUSTER_NAME:-nkp-workload1}
+    ask CLUSTER_NAME "Workload cluster name" v_workload_name
+  else
+    CLUSTER_NAME=${CLUSTER_NAME:-nkp-mgmt}
+    ask CLUSTER_NAME "Management cluster name" v_cluster_name
+  fi
   CLUSTER_DIR="${WORKDIR}/${CLUSTER_NAME}"
   mkdir -p "$CLUSTER_DIR" && chmod 700 "$CLUSTER_DIR"
 }
@@ -739,6 +773,9 @@ q_network() {
     if [[ -n $NODE_POOLS ]] && ipcalc ip_in_ranges "$CONTROLPLANE_IP" "$NODE_POOLS"; then
       warn "${CONTROLPLANE_IP} is inside the IPAM pool ${NODE_POOLS}."; continue
     fi
+    if [[ -n $RESERVED_RANGES ]] && ipcalc ip_in_ranges "$CONTROLPLANE_IP" "$RESERVED_RANGES"; then
+      warn "${CONTROLPLANE_IP} is already used by another NKP cluster (${RESERVED_RANGES})."; continue
+    fi
     if [[ -n $NODE_CIDR ]] && ! ipcalc ip_in_cidr "$CONTROLPLANE_IP" "$NODE_CIDR"; then
       warn "${CONTROLPLANE_IP} is outside the node subnet ${NODE_CIDR}."
       ask_yn "Use it anyway?" N || continue
@@ -756,6 +793,9 @@ q_network() {
     fi
     if ipcalc ip_in_ranges "$CONTROLPLANE_IP" "$SERVICE_LB_IP_RANGE"; then
       warn "The range contains the control plane IP ${CONTROLPLANE_IP}."; continue
+    fi
+    if [[ -n $RESERVED_RANGES ]] && ipcalc range_overlaps "$SERVICE_LB_IP_RANGE" "$RESERVED_RANGES"; then
+      warn "The range overlaps addresses another NKP cluster uses (${RESERVED_RANGES})."; continue
     fi
     if [[ -n $NODE_CIDR ]] && ! ipcalc range_in_cidr "$SERVICE_LB_IP_RANGE" "$NODE_CIDR"; then
       warn "The range is not inside ${NODE_CIDR}. MetalLB needs addresses on the nodes' layer-2 subnet."
@@ -840,7 +880,9 @@ q_access() {
   NUTANIX_REGISTRY_ARGS=()
   local create_help
   create_help=$(nkp create cluster nutanix --help 2>&1 || true)
-  if [[ $create_help == *--nutanix-registry-username* ]]; then
+  if ((WORKLOAD)); then
+    info "Nutanix registry: workload clusters inherit the access token from ${MGMT_CLUSTER_NAME}."
+  elif [[ $create_help == *--nutanix-registry-username* ]]; then
     step "Nutanix registry (required)"
     info "NKP pulls its images with a Docker Hub service account issued on the Nutanix Portal."
     info "Portal: NKP download page > generate an access token (the page shows: docker login --username svcregistrynkp)."
@@ -912,8 +954,13 @@ q_extras() {
 }
 
 build_command() {
-  CMD=(nkp create cluster nutanix
-    --self-managed
+  CMD=(nkp create cluster nutanix)
+  if ((WORKLOAD)); then
+    CMD+=(--namespace="$WORKSPACE_NAMESPACE" --kubeconfig="$MGMT_KCFG")
+  else
+    CMD+=(--self-managed)
+  fi
+  CMD+=(
     --cluster-name="$CLUSTER_NAME"
     --endpoint="$NUTANIX_ENDPOINT"
     "${TRUST_ARGS[@]}"
@@ -965,6 +1012,10 @@ show_summary() {
   if [[ $USE_DOCKERHUB == Y ]]; then hub=$DOCKERHUB_USERNAME; fi
   if [[ $USE_PROXY == Y ]]; then proxy=$PROXY_HTTPS; fi
   row "Cluster name" "$CLUSTER_NAME"
+  if ((WORKLOAD)); then
+    row "Management cluster" "$MGMT_CLUSTER_NAME ($MGMT_KCFG)"
+    row "Workspace namespace" "$WORKSPACE_NAMESPACE"
+  fi
   row "Prism Central" "$NUTANIX_ENDPOINT (user ${NUTANIX_USER}, TLS: ${TLS_MODE})"
   row "Prism Element" "$NUTANIX_CLUSTER"
   row "Subnet" "$SUBNET${NODE_CIDR:+ ($NODE_CIDR)}"
@@ -993,7 +1044,9 @@ run_preflight() {
     ok "Preflight checks passed. Generated manifests: ${yaml} (contains credentials; mode 600)"
   else
     err "Preflight checks failed; see above or ${log}."
-    ask_yn "Continue to cluster creation anyway?" N || { info "Answers saved; rerun with --skip-prereqs to fix them."; exit 1; }
+    local rerun="${SCRIPT_PATH} --skip-prereqs"
+    if ((WORKLOAD)); then rerun="${SCRIPT_PATH} --workload"; fi
+    ask_yn "Continue to cluster creation anyway?" N || { info "Answers saved; fix them by rerunning: ${rerun}"; exit 1; }
   fi
 }
 
@@ -1002,12 +1055,22 @@ run_create() {
     info "--print-only: not creating the cluster. Command saved to ${CLUSTER_DIR}/create-cluster.cmd"
     exit 0
   fi
-  ask_yn "Create the management cluster now?" Y || { info "Answers saved; rerun with --skip-prereqs when ready."; exit 0; }
+  local kind=management rerun="${SCRIPT_PATH} --skip-prereqs"
+  if ((WORKLOAD)); then kind=workload rerun="${SCRIPT_PATH} --workload"; fi
+  ask_yn "Create the ${kind} cluster now?" Y || { info "Answers saved; rerun with: ${rerun}"; exit 0; }
   LOG="${CLUSTER_DIR}/create-cluster-$(date +%Y%m%d-%H%M%S).log"
   step "Creating ${CLUSTER_NAME} (log: ${LOG})"
   if ! (cd "$CLUSTER_DIR" && "${CMD[@]}") 2>&1 | tee -a "$LOG"; then
     err "Cluster creation failed. Full log: ${LOG}"
-    if [[ -f ${CLUSTER_DIR}/${CLUSTER_NAME}.conf ]]; then
+    if ((WORKLOAD)); then
+      if "${MGMT_K[@]}" -n "$WORKSPACE_NAMESPACE" get clusters.cluster.x-k8s.io "$CLUSTER_NAME" >/dev/null 2>&1; then
+        warn "${CLUSTER_NAME} exists on ${MGMT_CLUSTER_NAME} and keeps reconciling; do not create it again."
+        nkp describe cluster -c "$CLUSTER_NAME" -n "$WORKSPACE_NAMESPACE" --kubeconfig="$MGMT_KCFG" >&2 || true
+        info "Follow it with: nkp describe cluster -c ${CLUSTER_NAME} -n ${WORKSPACE_NAMESPACE} --kubeconfig=${MGMT_KCFG}"
+      else
+        info "Nothing was created. Fix the cause, then rerun: ${rerun}"
+      fi
+    elif [[ -f ${CLUSTER_DIR}/${CLUSTER_NAME}.conf ]]; then
       warn "The cluster itself exists (its VMs are running); only the steps after it failed."
       warn "Do not rerun the setup: it would try to create ${CLUSTER_NAME} again."
       cluster_status "${CLUSTER_DIR}/${CLUSTER_NAME}.conf"
@@ -1055,6 +1118,8 @@ phase_status() {
   kcfg="${WORKDIR}/${CLUSTER_NAME}/${CLUSTER_NAME}.conf"
   [[ -f $kcfg ]] || die "No kubeconfig at ${kcfg}. Has the cluster been created? (use --workdir if it lives elsewhere)"
   cluster_status "$kcfg"
+  info "Clusters in NKP workspaces (workload clusters show Joined once attached):"
+  kubectl --kubeconfig "$kcfg" get nkpclusters -A >&2 2>/dev/null || true
   nkp get dashboard --kubeconfig="$kcfg" 2>/dev/null || true
 }
 
@@ -1083,7 +1148,13 @@ post_install() {
       nkp rotate dashboard-credentials        # then: nkp get dashboard
       Dashboard > Global > Settings > Licensing > Activate License   (key from the Nutanix Portal)
       Node pool commands on this cluster need: -n kommander
+      Workload clusters: ${SCRIPT_PATH} --workload
 EOF
+  if ask_yn "Create a workload cluster on ${CLUSTER_NAME} now?" N; then
+    local args=(--workload --workdir "$WORKDIR")
+    if ((FORCE_INSECURE)); then args+=(--insecure); fi
+    exec bash "$SCRIPT_PATH" "${args[@]}"
+  fi
 }
 
 phase_setup() {
@@ -1110,9 +1181,164 @@ phase_setup() {
   post_install
 }
 
+# ---------------------------------------------------------------------------
+# Workload (managed) clusters
+# ---------------------------------------------------------------------------
+
+load_mgmt_context() {
+  local f="${WORKDIR}/nkp-install.env" json kv
+  [[ -f $f ]] || die "No management cluster answers at ${f}. Create the management cluster first, or pass --workdir."
+  # shellcheck disable=SC1090
+  . "$f"
+  MGMT_CLUSTER_NAME=$CLUSTER_NAME
+  MGMT_KCFG="${WORKDIR}/${MGMT_CLUSTER_NAME}/${MGMT_CLUSTER_NAME}.conf"
+  [[ -f $MGMT_KCFG ]] || die "No kubeconfig for ${MGMT_CLUSTER_NAME} at ${MGMT_KCFG}."
+  MGMT_K=(kubectl --kubeconfig "$MGMT_KCFG")
+  json=$("${MGMT_K[@]}" get clusters.cluster.x-k8s.io -A -o json 2>/dev/null) \
+    || die "Cannot list Cluster API clusters on ${MGMT_CLUSTER_NAME} with ${MGMT_KCFG}. Is it up? Try: ${SCRIPT_PATH} --status"
+  ok "Management cluster ${MGMT_CLUSTER_NAME} is reachable"
+  kv=$("${MGMT_K[@]}" get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null || true)
+  if [[ $kv =~ ^v?([0-9]+\.[0-9]+) ]]; then
+    K8S_VERSION_HINT=${BASH_REMATCH[1]}
+    info "${MGMT_CLUSTER_NAME} runs Kubernetes ${kv}; the workload node image should be built for ${K8S_VERSION_HINT}."
+  fi
+  RESERVED_RANGES=$(jq -r '
+      [ .items[]?
+        | (.spec.controlPlaneEndpoint.host // empty | select(test("^[0-9.]+$")) | "\(.)-\(.)"),
+          (.. | objects | select(has("addressRanges")) | .addressRanges[]? | select(.start and .end) | "\(.start)-\(.end)") ]
+      | unique | join(",")' <<<"$json" 2>/dev/null || true)
+  if [[ -n ${CONTROLPLANE_IP:-} ]]; then RESERVED_RANGES+="${RESERVED_RANGES:+,}${CONTROLPLANE_IP}-${CONTROLPLANE_IP}"; fi
+  if [[ -n ${SERVICE_LB_IP_RANGE:-} ]]; then RESERVED_RANGES+="${RESERVED_RANGES:+,}${SERVICE_LB_IP_RANGE}"; fi
+  RESERVED_RANGES=$(tr ',' '\n' <<<"$RESERVED_RANGES" | awk 'NF && !seen[$0]++' | paste -sd, - || true)
+  [[ -z $RESERVED_RANGES ]] || info "Addresses already used by NKP clusters: ${RESERVED_RANGES}"
+}
+
+q_workspace() {
+  step "Workspace"
+  info "NKP attaches the workload cluster to this workspace on ${MGMT_CLUSTER_NAME}."
+  local vals=() labels=() name ns ws="" i
+  while IFS=$'\t' read -r name ns; do
+    if [[ -n $ns ]]; then vals+=("$ns"); labels+=("${name}  (namespace ${ns})"); fi
+  done < <("${MGMT_K[@]}" get workspaces.workspaces.kommander.mesosphere.io -o json 2>/dev/null \
+    | jq -r '.items[] | [.metadata.name, (.spec.namespaceName // .status.namespaceRef.name // "")] | @tsv' || true)
+  vals+=(new); labels+=("Create a new workspace")
+  WORKSPACE_NAMESPACE=${WORKSPACE_NAMESPACE:-kommander-default-workspace}
+  pick WORKSPACE_NAMESPACE "Workspace for ${CLUSTER_NAME}" vals labels
+  if [[ $WORKSPACE_NAMESPACE == new ]]; then
+    ask ws "New workspace name (also its namespace)" v_dns_label
+    "${MGMT_K[@]}" apply -f - >/dev/null <<EOF || die "Could not create workspace ${ws}."
+apiVersion: workspaces.kommander.mesosphere.io/v1alpha1
+kind: Workspace
+metadata:
+  name: ${ws}
+  annotations:
+    kommander.mesosphere.io/display-name: ${ws}
+spec:
+  namespaceName: ${ws}
+EOF
+    WORKSPACE_NAMESPACE=$ws
+    for ((i = 0; i < 30; i++)); do
+      if "${MGMT_K[@]}" get namespace "$ws" >/dev/null 2>&1; then break; fi
+      sleep 2
+    done
+    ok "Workspace ${ws} created"
+  fi
+  "${MGMT_K[@]}" get namespace "$WORKSPACE_NAMESPACE" >/dev/null 2>&1 \
+    || die "Namespace ${WORKSPACE_NAMESPACE} does not exist on ${MGMT_CLUSTER_NAME}."
+}
+
+post_workload() {
+  local kcfg="${CLUSTER_DIR}/${CLUSTER_NAME}.conf" i out total pending joined=0
+  local describe=(nkp describe cluster -c "$CLUSTER_NAME" -n "$WORKSPACE_NAMESPACE" --kubeconfig="$MGMT_KCFG")
+  step "Waiting for ${CLUSTER_NAME}"
+  info "${MGMT_CLUSTER_NAME} provisions the VMs; this usually takes 15-30 minutes. Progress: ${describe[*]}"
+  if "${MGMT_K[@]}" -n "$WORKSPACE_NAMESPACE" wait --for=condition=Ready "clusters.cluster.x-k8s.io/${CLUSTER_NAME}" --timeout=60m; then
+    ok "${CLUSTER_NAME} is Ready"
+  else
+    warn "${CLUSTER_NAME} is not Ready after 60 minutes."
+    "${describe[@]}" >&2 || true
+  fi
+  if (umask 077 && nkp get kubeconfig -c "$CLUSTER_NAME" -n "$WORKSPACE_NAMESPACE" --kubeconfig="$MGMT_KCFG" >"$kcfg"); then
+    ok "Kubeconfig: ${kcfg}"
+  else
+    rm -f "$kcfg"
+    warn "Could not fetch the kubeconfig yet. Later: nkp get kubeconfig -c ${CLUSTER_NAME} -n ${WORKSPACE_NAMESPACE} --kubeconfig=${MGMT_KCFG} > ${kcfg}"
+    return
+  fi
+  kubectl --kubeconfig "$kcfg" get nodes -o wide >&2 || true
+
+  info "Waiting for ${CLUSTER_NAME} to join workspace ${WORKSPACE_NAMESPACE} (up to 20 minutes)..."
+  for ((i = 0; i < 120; i++)); do
+    out=$("${MGMT_K[@]}" -n "$WORKSPACE_NAMESPACE" get nkpclusters "$CLUSTER_NAME" --no-headers 2>/dev/null || true)
+    if [[ $out == *Joined* ]]; then joined=1; break; fi
+    sleep 10
+  done
+  if ((joined)); then ok "${CLUSTER_NAME} joined ${WORKSPACE_NAMESPACE}"
+  else warn "${CLUSTER_NAME} has not joined yet. Check: kubectl --kubeconfig ${MGMT_KCFG} get nkpclusters -A"; fi
+
+  info "Waiting for the platform applications on ${CLUSTER_NAME} (up to 30 minutes)..."
+  for ((i = 0; i < 180; i++)); do
+    out=$(kubectl --kubeconfig "$kcfg" -n "$WORKSPACE_NAMESPACE" get helmreleases --no-headers 2>/dev/null || true)
+    total=$(grep -c . <<<"$out" || true)
+    pending=$(awk '$3 != "True"' <<<"$out" | grep -c . || true)
+    if ((total > 0 && pending == 0)); then break; fi
+    sleep 10
+  done
+  if ((total > 0 && pending == 0)); then ok "All ${total} platform applications are ready"
+  else
+    warn "${pending} of ${total} platform applications are not ready yet:"
+    awk '$3 != "True"' <<<"$out" | sed 's/^/      /' >&2 || true
+    info "Pending pods? Add workers: nkp scale nodepools md-0 --replicas=<n> -c ${CLUSTER_NAME} -n ${WORKSPACE_NAMESPACE} --kubeconfig=${MGMT_KCFG}"
+  fi
+  cat >&2 <<EOF
+
+    Next steps:
+      export KUBECONFIG=${kcfg}
+      kubectl get nodes
+      NKP dashboard (on ${MGMT_CLUSTER_NAME}): workspace ${WORKSPACE_NAMESPACE} > Clusters > ${CLUSTER_NAME}
+      Node pools: nkp get nodepools -c ${CLUSTER_NAME} -n ${WORKSPACE_NAMESPACE} --kubeconfig=${MGMT_KCFG}
+      Another workload cluster: ${SCRIPT_PATH} --workload
+EOF
+}
+
+phase_workload() {
+  step "Workload cluster"
+  command -v nkp >/dev/null || die "nkp CLI not found. Run the setup without --workload first."
+  ensure_docker_access
+  ensure_tmux_session
+  PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NUTANIX_REGISTRY_ARGS=() NODE_CIDR="" NODE_POOLS=""
+  load_mgmt_context
+  CLUSTER_NAME="" CONTROLPLANE_IP="" SERVICE_LB_IP_RANGE=""
+  ANSWERS_FILE="${WORKDIR}/nkp-workload.env"
+  if [[ -f $ANSWERS_FILE ]] && ask_yn "Found answers from a previous workload cluster. Use them as defaults?" Y; then
+    # shellcheck disable=SC1090
+    . "$ANSWERS_FILE"
+  else
+    info "Defaults come from the ${MGMT_CLUSTER_NAME} answers; the name and IP addresses must be new."
+  fi
+  PROXY_NO=""
+  q_cluster
+  q_workspace
+  q_prism_central
+  q_inventory
+  q_network
+  q_sizing
+  q_access
+  q_extras
+  save_answers
+  ok "Answers saved to ${ANSWERS_FILE} (no passwords)"
+  build_command
+  show_summary
+  export NUTANIX_USER NUTANIX_PASSWORD
+  run_preflight
+  run_create
+  post_workload
+}
+
 main() {
   parse_args "$@"
   if ((STATUS_ONLY)); then phase_status; return 0; fi
+  if ((WORKLOAD)); then phase_workload; return 0; fi
   ((DO_PREREQS)) && phase_prereqs
   ((DO_SETUP)) && phase_setup
   return 0
