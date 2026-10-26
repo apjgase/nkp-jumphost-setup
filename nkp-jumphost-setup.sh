@@ -1472,6 +1472,10 @@ run_create() {
   if ((WORKLOAD)); then kind=workload rerun="${SCRIPT_PATH} --workload"; fi
   ask_yn "Create the ${kind} cluster now?" Y || { info "Answers saved; rerun with: ${rerun}"; exit 0; }
   LOG="${CLUSTER_DIR}/create-cluster-$(date +%Y%m%d-%H%M%S).log"
+  if ((!WORKLOAD)) && [[ -f ${CLUSTER_DIR}/${CLUSTER_NAME}.conf ]]; then
+    mv "${CLUSTER_DIR}/${CLUSTER_NAME}.conf" "${CLUSTER_DIR}/${CLUSTER_NAME}.conf.old-$(date +%Y%m%d-%H%M%S)"
+    info "Moved the kubeconfig of an earlier ${CLUSTER_NAME} aside (${CLUSTER_NAME}.conf.old-*)."
+  fi
   step "Creating ${CLUSTER_NAME} (log: ${LOG})"
   if ! (cd "$CLUSTER_DIR" && "${CMD[@]}") 2>&1 | tee -a "$LOG"; then
     err "Cluster creation failed. Full log: ${LOG}"
@@ -1495,12 +1499,31 @@ run_create() {
         info "(nkp install kommander --kubeconfig ... --kommander-applications-repository <bundle>/application-repositories/...)"
         info "or start over: ${SCRIPT_PATH} --destroy, then rerun the setup."
       fi
+    elif bootstrap_has_cluster; then
+      warn "${CLUSTER_NAME} never became reachable; its Cluster API objects are still on the local bootstrap cluster."
+      info "See what is stuck (NKP guide): nkp describe cluster -c ${CLUSTER_NAME} -n ${BOOT_NS} --kubeconfig ${BOOT_KCFG}"
+      info "  kubectl --kubeconfig ${BOOT_KCFG} -n ${BOOT_NS} get kubeadmcontrolplane,machines,nutanixmachines -o wide"
+      info "  kubectl --kubeconfig ${BOOT_KCFG} -n capx-system logs -l cluster.x-k8s.io/provider=infrastructure-nutanix --tail=100"
+      info "Its kubeconfig, to look inside: nkp get kubeconfig -c ${CLUSTER_NAME} -n ${BOOT_NS} --kubeconfig ${BOOT_KCFG}"
+      info "To start over: ${SCRIPT_PATH} --destroy (deletes it through the bootstrap cluster), then rerun the setup."
     else
       info "If a local bootstrap cluster was left behind, remove it with: nkp delete bootstrap"
       info "Fix the cause, then rerun: ${SCRIPT_PATH} --skip-prereqs"
     fi
     exit 1
   fi
+}
+
+BOOT_KCFG="" BOOT_NS=""
+bootstrap_has_cluster() { # sets BOOT_KCFG and BOOT_NS when the local bootstrap (kind) cluster holds CLUSTER_NAME
+  local ns name
+  BOOT_KCFG="${HOME}/.kube/config"
+  [[ -f $BOOT_KCFG ]] || return 1
+  while read -r ns name; do
+    if [[ $name == "$CLUSTER_NAME" ]]; then BOOT_NS=$ns; return 0; fi
+  done < <(kubectl --kubeconfig "$BOOT_KCFG" --context kind-konvoy-capi-bootstrapper --request-timeout=15s \
+             get clusters.cluster.x-k8s.io -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name 2>/dev/null || true)
+  return 1
 }
 
 cluster_status() { # kubeconfig
@@ -2253,18 +2276,24 @@ phase_destroy() {
       nkp delete bootstrap --kubeconfig="$boot" >&2 || warn "Could not remove the bootstrap cluster: nkp delete bootstrap --kubeconfig=${boot}"
     fi
     ok "${CLUSTER_NAME} deleted"
+  elif bootstrap_has_cluster; then
+    step "Deleting ${CLUSTER_NAME} through the local bootstrap cluster (it never became self-managed)"
+    nkp delete cluster -c "$CLUSTER_NAME" -n "$BOOT_NS" --kubeconfig="$BOOT_KCFG" >&2 \
+      || die "Deleting ${CLUSTER_NAME} failed; the subnet was not restored. Rerun --destroy."
+    nkp delete bootstrap --kubeconfig="$BOOT_KCFG" >&2 || warn "Could not remove the bootstrap cluster: nkp delete bootstrap --kubeconfig=${BOOT_KCFG}"
+    ok "${CLUSTER_NAME} deleted"
   else
-    warn "${CLUSTER_NAME} is not reachable with ${kcfg}; no cluster was deleted."
+    warn "${CLUSTER_NAME} is not reachable with ${kcfg}, and no bootstrap cluster holds it; no cluster was deleted."
     ask_yn "Restore the subnet anyway?" N || exit 1
   fi
 
   restore_subnet
   archive="${WORKDIR}/archive-$(date +%Y%m%d-%H%M%S)"
   mkdir -m 700 "$archive"
-  for f in nkp-ip-plan.env nkp-install.env nkp-workload.env lab-summary.txt "${CLUSTER_NAME}/harbor-push.env"; do
+  for f in nkp-ip-plan.env nkp-install.env nkp-workload.env lab-summary.txt "${CLUSTER_NAME}/harbor-push.env" "${CLUSTER_NAME}/${CLUSTER_NAME}.conf"; do
     if [[ -f ${WORKDIR}/${f} ]]; then mv "${WORKDIR}/${f}" "$archive/"; fi
   done
-  ok "Answers, IP plan and Harbor push record moved to ${archive}"
+  ok "Answers, IP plan, Harbor push record and kubeconfig moved to ${archive}"
 }
 
 # ---------------------------------------------------------------------------
