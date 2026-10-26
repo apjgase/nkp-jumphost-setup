@@ -233,7 +233,7 @@ CONTROLPLANE_IP=                  # blank = from the IP plan
 SERVICE_LB_IP_RANGE=              # blank = from the IP plan
 POD_CIDR=192.168.0.0/16
 SERVICE_CIDR=10.96.0.0/12
-SIZING=starter                    # pro | starter | custom (then CP_* and WK_* below)
+SIZING=pro                        # pro | starter | custom (then CP_* and WK_* below); starter is too small for a management cluster
 CP_REPLICAS=
 CP_VCPUS=
 CP_MEMORY=
@@ -1085,7 +1085,8 @@ q_network() { # [ips-only]
   done
 }
 
-q_sizing() {
+q_sizing() { # [workload]
+  local kind=${1:-management}
   step "Node sizing"
   local vals=(pro starter custom)
   local labels=("Pro/Ultimate default: 3 control plane (4 vCPU, 16 GiB) + 4 workers (8 vCPU, 32 GiB)"
@@ -1112,6 +1113,12 @@ q_sizing() {
       SIZING_ARGS=(--control-plane-replicas="$CP_REPLICAS" --control-plane-vcpus="$CP_VCPUS" --control-plane-memory="$CP_MEMORY"
                    --worker-replicas="$WK_REPLICAS" --worker-vcpus="$WK_VCPUS" --worker-memory="$WK_MEMORY") ;;
   esac
+  if [[ $kind == management && $SIZING == starter ]]; then
+    warn "Starter nodes (2 vCPU / 8 GiB control plane, 4 vCPU / 8 GiB workers) are too small for a management cluster:"
+    warn "Kommander times out (KommanderInitialized) and there is no room for Harbor and Rook Ceph."
+    ask_yn "Use Starter sizing for the management cluster anyway?" N \
+      || die "Set SIZING=pro (or custom with workers of at least 8 vCPU / 32 GiB) and rerun."
+  fi
   if [[ $SIZING == starter && ${VM_IMAGE,,} != *rocky* ]]; then
     warn "The Starter license supports Rocky Linux images only; '${VM_IMAGE}' needs Pro or Ultimate."
   fi
@@ -1480,7 +1487,14 @@ run_create() {
       warn "The cluster itself exists (its VMs are running); only the steps after it failed."
       warn "Do not rerun the setup: it would try to create ${CLUSTER_NAME} again."
       cluster_status "${CLUSTER_DIR}/${CLUSTER_NAME}.conf"
-      info "Platform apps keep retrying on their own. Check again with: ${SCRIPT_PATH} --status"
+      if [[ -n $(kubectl --kubeconfig "${CLUSTER_DIR}/${CLUSTER_NAME}.conf" -n kommander get helmreleases --no-headers 2>/dev/null || true) ]]; then
+        info "Platform apps keep retrying on their own. Check again with: ${SCRIPT_PATH} --status"
+      else
+        info "Kommander stopped before deploying any platform app; it does not resume by itself."
+        info "Fix the cause (often nodes too small: see 'kubectl top nodes'), then either retry Kommander per the NKP guide"
+        info "(nkp install kommander --kubeconfig ... --kommander-applications-repository <bundle>/application-repositories/...)"
+        info "or start over: ${SCRIPT_PATH} --destroy, then rerun the setup."
+      fi
     else
       info "If a local bootstrap cluster was left behind, remove it with: nkp delete bootstrap"
       info "Fix the cause, then rerun: ${SCRIPT_PATH} --skip-prereqs"
@@ -1493,9 +1507,13 @@ cluster_status() { # kubeconfig
   local k=(kubectl --kubeconfig "$1") out
   step "Cluster status (${1})"
   "${k[@]}" get nodes -o wide >&2 || { warn "The cluster API is not reachable with this kubeconfig."; return 0; }
-  out=$("${k[@]}" -n kommander get helmreleases 2>&1 | awk 'NR == 1 || $0 !~ /True/' || true)
-  if [[ $(wc -l <<<"$out") -le 1 ]]; then ok "All platform applications are ready"
-  else info "Platform applications not ready:"; printf '%s\n' "$out" >&2; fi
+  out=$("${k[@]}" -n kommander get helmreleases --no-headers 2>/dev/null || true)
+  if [[ -z $out ]]; then
+    warn "No platform applications (HelmReleases in kommander): Kommander did not get past its own installation."
+    "${k[@]}" get gitclaims.git.nutanix.com -A >&2 2>/dev/null || true
+  elif ! awk '$0 !~ /True/ {exit 1}' <<<"$out"; then
+    info "Platform applications not ready:"; awk '$0 !~ /True/' <<<"$out" >&2
+  else ok "All platform applications are ready"; fi
   out=$("${k[@]}" get pods -A 2>&1 | awk 'NR == 1 || ($4 != "Running" && $4 != "Completed") || $3 ~ /^0\//' || true)
   if [[ $(wc -l <<<"$out") -gt 1 ]]; then
     info "Pods not running or not ready:"; printf '%s\n' "$out" >&2
@@ -1732,7 +1750,7 @@ q_lab_workload() { # workload answers asked up front, checked offline: the manag
   q_network ips-only
   RESERVED_RANGES=""
   SIZING=${SIZING:-$WL_SIZING}
-  q_sizing
+  q_sizing workload
   WL_NEED=$(sizing_need)
   ANSWERS_FILE="${WORKDIR}/nkp-workload.env"
   save_answers
@@ -2133,7 +2151,7 @@ phase_workload() {
   q_prism_central
   q_inventory
   q_network
-  q_sizing
+  q_sizing workload
   q_mgmt_registry
   q_access
   q_extras
@@ -2493,6 +2511,15 @@ check_ip_plan() {
 # shellcheck disable=SC2030,SC2031  # sizing is computed in subshells so the real answers stay untouched
 check_capacity() {
   step "Capacity of ${NUTANIX_CLUSTER}"
+  if [[ ! -f ${WORKDIR}/${CLUSTER_NAME}/${CLUSTER_NAME}.conf ]]; then
+    case ${SIZING:-pro} in
+      starter) res FAIL "Management sizing" "SIZING=starter (4 vCPU / 8 GiB workers) is too small: Kommander times out, no room for Harbor; set SIZING=pro" ;;
+      custom) if ((${WK_VCPUS:-8} < 8 || ${WK_MEMORY:-32} < 32)); then
+                res WARN "Management sizing" "workers ${WK_VCPUS:-8} vCPU / ${WK_MEMORY:-32} GiB are below the Pro default (8 vCPU / 32 GiB)"
+              else res PASS "Management sizing" "custom: ${WK_REPLICAS:-4} workers, ${WK_VCPUS:-8} vCPU / ${WK_MEMORY:-32} GiB"; fi ;;
+      *) res PASS "Management sizing" "pro: 3 x 4 vCPU / 16 GiB control plane, 4 x 8 vCPU / 32 GiB workers" ;;
+    esac
+  fi
   local n=0 c=0 m=0 n2 c2 m2 disk cvm usable what="management + workload"
   local HOSTS="" CORES=0 HOST_MEM_GIB=0 VM_VCPU=0 VM_MEM_GIB=0 SC_FREE_GIB="" VMS_OK=N
   [[ -n $PE_UUID ]] || { res SKIP "Capacity" "no Prism Element"; return 0; }
