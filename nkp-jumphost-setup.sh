@@ -226,7 +226,7 @@ NUTANIX_ENDPOINT=                 # Prism Central, e.g. https://10.42.x.39:9440
 NUTANIX_USER=admin
 TLS_MODE=insecure                 # insecure | fetched | cafile (with PC_CA_FILE)
 NUTANIX_CLUSTER=                  # Prism Element name; blank = the only one
-SUBNET=Primary
+SUBNET=                           # blank = primary, or primary-<Prism Element>
 VM_IMAGE=                         # blank = the only image whose name contains 1.36
 STORAGE_CONTAINER_NAME=default
 CONTROLPLANE_IP=                  # blank = from the IP plan
@@ -876,7 +876,7 @@ q_inventory() {
       fi
     done < <(py pc subnets "$NUTANIX_CLUSTER" 2>/dev/null || true)
   fi
-  default_match SUBNET subnet_vals '^primary$'
+  default_match SUBNET subnet_vals '^primary(-|$)'
   pick SUBNET "Subnet for control plane and worker nodes (must have IPAM or DHCP)" subnet_vals subnet_labels
 
   NODE_POOLS=""
@@ -2306,7 +2306,7 @@ check_host() {
     if [[ $help == *--to-registry* ]]; then res PASS "nkp push bundle" "--to-registry available"
     else res FAIL "nkp push bundle" "no --to-registry in 'nkp push bundle --help'"; fi
   else
-    res FAIL "nkp CLI" "not on PATH; run the setup with --prereqs-only --package <nkp-bundle_*.tar.gz>"
+    res FAIL "nkp CLI" "not on PATH; run the setup with --prereqs-only (it installs nkp from the NKP package)"
   fi
   if command -v tmux >/dev/null; then res PASS "tmux" "installed"; else res WARN "tmux" "missing; long runs stop if SSH drops"; fi
   v=${SSH_PUBLIC_KEY:-${HOME}/.ssh/id_ed25519.pub}
@@ -2329,12 +2329,22 @@ check_selftest() {
 
 check_bundle() {
   step "Image bundle"
-  local dir files parts f kb=0 free_kb errf
+  local dir files parts f kb=0 free_kb errf pkg d
   if [[ ${USE_BUNDLE:-} == N ]]; then res SKIP "Bundle" "USE_BUNDLE=N: images come from the internet"; return 0; fi
   dir=${BUNDLE_DIR_ARG:-${BUNDLE_DIR:-}}
   [[ -n $dir && -d $dir ]] || dir=$(bundle_candidates | awk 'NR == 1')
   if [[ -z $dir ]]; then
-    if [[ ${USE_BUNDLE:-} == Y ]]; then res FAIL "Bundle" "USE_BUNDLE=Y, but no nkp-v${NKP_MINOR}.x/container-images found (--bundle-dir DIR)"
+    pkg=${PACKAGE:-$(for d in "$PWD" "$HOME" "$HOME/Downloads"; do
+      find "$d" -maxdepth 1 -type f -name 'nkp[_-]*linux_amd64.tar.gz' 2>/dev/null; done | sort -rV | awk 'NR == 1')}
+    if [[ -n $pkg && -r $pkg && $(basename "$pkg") == nkp*bundle_v"${NKP_MINOR}".* ]]; then
+      kb=$(du -kL "$pkg" | awk '{print $1}')
+      free_kb=$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {print $4}' || true)
+      if [[ -n $free_kb ]] && ((free_kb < kb * 11 / 10)); then
+        res FAIL "Bundle" "${pkg} ($((kb / 1024 / 1024)) GiB) is not extracted, and ${HOME} has only $((free_kb / 1024 / 1024)) GiB free to extract it"
+      else
+        res WARN "Bundle" "${pkg} ($((kb / 1024 / 1024)) GiB) is not extracted yet; --prereqs-only extracts it into ${HOME}/nkp-dist"
+      fi
+    elif [[ ${USE_BUNDLE:-} == Y ]]; then res FAIL "Bundle" "USE_BUNDLE=Y, but no nkp-v${NKP_MINOR}.x/container-images found (--bundle-dir DIR)"
     else res WARN "Bundle" "no nkp-v${NKP_MINOR}.x/container-images under ${HOME}/nkp-dist or ${HOME}: images would come from the internet"; fi
     return 0
   fi
@@ -2356,7 +2366,7 @@ check_bundle() {
 
 check_pc() { # -> 1 when the later Prism Central checks cannot run
   step "Prism Central"
-  local rc=0 code names=() uuids=() name uuid label cidr pools i found="" imgs=() cands=() scs=()
+  local rc=0 code names=() uuids=() name uuid label cidr pools i found="" imgs=() cands=() scs=() hint sub=${SUBNET:-}
   if ((!CHECK_PY)); then res SKIP "Prism Central" "no python3"; return 1; fi
   [[ -n ${NUTANIX_ENDPOINT:-} ]] || { res FAIL "Prism Central" "NUTANIX_ENDPOINT is not set"; return 1; }
   NUTANIX_ENDPOINT=$(normalize_endpoint "$NUTANIX_ENDPOINT")
@@ -2391,11 +2401,16 @@ check_pc() { # -> 1 when the later Prism Central checks cannot run
   while IFS=$'\t' read -r name uuid label cidr pools; do
     [[ -n $name ]] || continue
     names+=("$name")
-    if [[ $name == "${SUBNET:-}" || ( -z ${SUBNET:-} && ${name,,} == primary ) ]]; then
+    if [[ $name == "${SUBNET:-}" ]] || [[ -z $found && ${name,,} == "${sub,,}" ]] \
+       || [[ -z $found && -z ${SUBNET:-} && ${name,,} =~ ^primary(-|$) ]]; then
       found=$name SUBNET_UUID=$uuid NODE_CIDR=$cidr NODE_POOLS=$pools
     fi
   done < <(py pc subnets "$NUTANIX_CLUSTER" 2>/dev/null || true)
-  if [[ -z $found ]]; then res FAIL "Subnet" "'${SUBNET:-}' not found on ${NUTANIX_CLUSTER}; subnets: ${names[*]:-none}"
+  if [[ -z $found ]]; then
+    hint=$(printf '%s\n' "${names[@]}" | awk -v w="${sub,,}" 'index(tolower($0), w) == 1 {print; exit}')
+    res FAIL "Subnet" "'${SUBNET:-}' not found on ${NUTANIX_CLUSTER}${hint:+; set SUBNET=${hint}}; subnets: ${names[*]:-none}"
+  elif [[ -n ${SUBNET:-} && $found != "$SUBNET" ]]; then
+    res WARN "Subnet" "SUBNET=${SUBNET} matches '${found}' only ignoring case; set SUBNET=${found}"
   elif [[ -z $NODE_POOLS ]]; then res WARN "Subnet" "${found} has no IPAM pool: nodes need DHCP, and no IP plan is made"
   else res PASS "Subnet" "${found}: ${NODE_CIDR}, IPAM pool ${NODE_POOLS}"; fi
   SUBNET=${found:-${SUBNET:-}}
