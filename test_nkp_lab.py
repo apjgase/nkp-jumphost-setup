@@ -93,6 +93,7 @@ class Handler(BaseHTTPRequestHandler):
                 b = self.body()
                 f.puts.append(b)
                 f.subnet["spec"] = b["spec"]
+                f.subnet["status"]["resources"]["ip_config"]["pool_list"] = b["spec"]["resources"]["ip_config"].get("pool_list", [])
                 return self.send(202, {"status": {"execution_context": {"task_uuid": "t1"}}})
             return self.send(200, f.subnet)
         if p == "/api/nutanix/v3/tasks/t1":
