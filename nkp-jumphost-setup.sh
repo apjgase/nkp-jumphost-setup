@@ -635,6 +635,10 @@ find_package() {
   esac
 }
 
+nkp_release() { # the "nkp:" line of 'nkp version' (the other lines are component versions such as catalog: v0.11.1)
+  nkp version 2>/dev/null | awk '$1 == "nkp:" {print $2; exit}' || true
+}
+
 install_nkp() {
   local dest bin ver
   [[ -n $PACKAGE ]] || find_package
@@ -654,8 +658,8 @@ install_nkp() {
     [[ -n $bin ]] || die "No nkp binary found inside ${PACKAGE}."
     "${SUDO[@]}" install -m 0755 "$bin" /usr/local/bin/nkp
   fi
-  ver=$(nkp version 2>&1 | head -5 || true)
-  if grep -q "${NKP_MINOR}" <<<"$ver"; then ok "nkp CLI: $(head -1 <<<"$ver")"; else warn "nkp reports: ${ver//$'\n'/ }. Expected ${NKP_MINOR}.x."; fi
+  ver=$(nkp_release)
+  if [[ $ver == v"${NKP_MINOR}".* ]]; then ok "nkp CLI: ${ver}"; else warn "nkp version reports ${ver:-no nkp: line}. Expected v${NKP_MINOR}.x."; fi
 }
 
 phase_prereqs() {
@@ -2297,8 +2301,8 @@ check_host() {
   if command -v kubectl >/dev/null; then res PASS "kubectl" "$(kubectl version --client 2>/dev/null | head -1 || true)"
   else res FAIL "kubectl" "not installed; run the setup with --prereqs-only"; fi
   if command -v nkp >/dev/null; then
-    v=$(nkp version 2>&1 | head -1 || true)
-    if [[ $v == *"$NKP_MINOR"* ]]; then res PASS "nkp CLI" "$v"; else res FAIL "nkp CLI" "${v:-no version}; expected ${NKP_MINOR}.x"; fi
+    v=$(nkp_release)
+    if [[ $v == v"${NKP_MINOR}".* ]]; then res PASS "nkp CLI" "$v"; else res FAIL "nkp CLI" "nkp version reports ${v:-no nkp: line}; expected v${NKP_MINOR}.x"; fi
     help=$(nkp create cluster nutanix --help 2>&1 || true)
     if [[ $help == *--bundle* && $help == *--registry-mirror-url* ]]; then res PASS "nkp create flags" "--bundle, --registry-mirror-url"
     else res FAIL "nkp create flags" "no --bundle or --registry-mirror-url in 'nkp create cluster nutanix --help'"; fi
