@@ -79,7 +79,7 @@ class Http:
         self.base = base.rstrip("/")
         self.ctx = tls_context(tls)
         self.timeout = timeout
-        token = base64.b64encode(f"{user}:{password}".encode()).decode() if user else None
+        token = base64.b64encode(f"{user}:{password}".encode()).decode() if user and password else None
         self.headers = {"Accept": "application/json"}
         if token:
             self.headers["Authorization"] = "Basic " + token
@@ -815,12 +815,13 @@ def main(argv=None):
     kp("md0").add_argument("cluster")
     p = kp("hr-reconcile"); p.add_argument("namespace"); p.add_argument("names", nargs="+")
     p = kp("ncr"); p.add_argument("--ca-out")
-    kp("harbor-password"); kp("uid")
+    kp("harbor-password"); kp("uid"); kp("harbor-prereqs")
     p = kp("harbor-deploy"); p.add_argument("--namespace", default="kommander"); p.add_argument("--overrides-file")
     p.add_argument("--ceph-count", type=int, default=8); p.add_argument("--wait", type=int, default=30)
 
     g = sub.add_parser("harbor").add_subparsers(dest="cmd", required=True)
     g.add_parser("ping")
+    g.add_parser("whoami")
     p = g.add_parser("ensure-project"); p.add_argument("name")
     p = g.add_parser("public"); p.add_argument("name")
     p = g.add_parser("repos"); p.add_argument("name")
@@ -982,6 +983,15 @@ def run(a):  # noqa: C901 - one dispatch table
             ns = k.json("get", "namespace", "kube-system")
             print(ns["metadata"]["uid"])
             return 0
+        if a.cmd == "harbor-prereqs":
+            rook = k.json("-n", "kommander", "get", "appdeployments.apps.kommander.d2iq.io", "rook-ceph-cluster", check=False) or {}
+            sc = k.json("get", "storageclass", "dkp-object-store", check=False)
+            present = bool(k.json("-n", "ncr-system", "get", "secret", "harbor-admin-password", check=False))
+            kv(CNPG_APP=cluster_app(k, "cloudnative-pg"), HARBOR_APP=cluster_app(k, "harbor"),
+               ROOK_ENABLED="Y" if rook else "N",
+               ROOK_OVERRIDES=((rook.get("spec") or {}).get("configOverrides") or {}).get("name", ""),
+               OBJECT_STORE="Y" if sc else "N", NCR_HOST=ncr_info(k)[0], NCR_PRESENT="Y" if present else "N")
+            return 0
         if a.cmd == "harbor-deploy":
             print(harbor_deploy(k, a.namespace, a.overrides_file, a.ceph_count, a.wait))
             return 0
@@ -991,6 +1001,9 @@ def run(a):  # noqa: C901 - one dispatch table
         if a.cmd == "ping":
             status, _ = h.request("GET", "/api/v2.0/ping")
             return 0 if status == 200 else 1
+        if a.cmd == "whoami":
+            print((h.api("GET", "/api/v2.0/users/current") or {}).get("username", ""))
+            return 0
         if a.cmd == "ensure-project":
             status, _ = h.request("HEAD", f"/api/v2.0/projects?project_name={urllib.parse.quote(a.name)}")
             if status == 200:

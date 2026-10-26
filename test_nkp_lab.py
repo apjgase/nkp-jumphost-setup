@@ -69,6 +69,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def route(self):
         f = self.fake
+        if self.path == "/api/v2.0/ping":
+            return self.send(200, "Pong")
         if self.headers.get("Authorization") != AUTH:
             return self.send(401, {"message": "unauthorized"})
         u = urllib.parse.urlsplit(self.path)
@@ -118,8 +120,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"data": [{"numberOfCpuCores": 32, "memorySizeBytes": 512 * nkp_lab.GIB}] * 3})
         if p == "/api/clustermgmt/v4.0/stats/storage-containers/sc-1":
             return self.send(200, {"data": {"storageUsageBytes": [{"value": 100 * nkp_lab.GIB}, {"value": 400 * nkp_lab.GIB}]}})
-        if p == "/api/v2.0/ping":
-            return self.send(200, "Pong")
+        if p == "/api/v2.0/users/current":
+            return self.send(200, {"username": "admin"})
         if p == "/api/v2.0/projects" and m == "HEAD":
             return self.send(200 if q["project_name"][0] in f.projects else 404)
         if p == "/api/v2.0/projects" and m == "POST":
@@ -266,6 +268,15 @@ class Harbor(ServerTest):
     def test_wrong_password(self):
         os.environ["NKP_HARBOR_PASSWORD"] = "nope"
         self.assertNotEqual(run("harbor", "ensure-project", "nkp")[0], 0)
+        self.assertNotEqual(run("harbor", "whoami")[0], 0)
+
+    def test_ping_without_password(self):
+        os.environ["NKP_HARBOR_PASSWORD"] = ""
+        self.assertEqual(run("harbor", "ping")[0], 0)
+        self.assertNotEqual(run("harbor", "whoami")[0], 0)
+
+    def test_whoami(self):
+        self.assertEqual(run("harbor", "whoami")[1], "admin\n")
 
 
 class Pure(unittest.TestCase):
@@ -383,6 +394,15 @@ class KubeMock(unittest.TestCase):
             {"metadata": {"name": "x"}, "spec": {"namespaceName": "x"}}, {"metadata": {"name": "broken"}}]})
         self.assertEqual(run("k8s", "workspaces", "--kubeconfig", "k")[1],
                          "default-workspace\tkommander-default-workspace\nx\tx\n")
+
+    def test_harbor_prereqs(self):
+        self.put("get_clusterapps.apps.kommander.d2iq.io", {"items": [
+            {"metadata": {"name": "cloudnative-pg-1.25.1"}}, {"metadata": {"name": "harbor-2.14.1"}}]})
+        self.put("-n_kommander_get_appdeployments.apps.kommander.d2iq.io_rook-ceph-cluster",
+                 {"spec": {"configOverrides": {"name": "my-ceph"}}})
+        self.assertEqual(kv(run("k8s", "harbor-prereqs", "--kubeconfig", "k")[1]), {
+            "CNPG_APP": "cloudnative-pg-1.25.1", "HARBOR_APP": "harbor-2.14.1", "ROOK_ENABLED": "Y",
+            "ROOK_OVERRIDES": "my-ceph", "OBJECT_STORE": "N", "NCR_HOST": "", "NCR_PRESENT": "N"})
 
     def test_cluster_app_newest(self):
         self.put("get_clusterapps.apps.kommander.d2iq.io", {"items": [

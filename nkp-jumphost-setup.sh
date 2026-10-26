@@ -22,6 +22,7 @@
 #         values. Prism Central, Kubernetes and Harbor API calls are in nkp_lab.py (keep it next to this script).
 #
 # Usage:
+#   ./nkp-jumphost-setup.sh --check --config nkp-lab.env   (before deploying: nothing is changed)
 #   ./nkp-jumphost-setup.sh --lab [--config nkp-lab.env]
 #   ./nkp-jumphost-setup.sh [--package nkp-bundle_v2.19.x_linux_amd64.tar.gz] [options]
 #   ./nkp-jumphost-setup.sh --harbor
@@ -39,6 +40,10 @@
 #   --skip-prereqs    Run phase 2 only.
 #   --print-only      Do everything except the final cluster creation; print the command.
 #   --insecure        Do not verify Prism Central's TLS certificate, without asking.
+#   --check           Read-only readiness test of the real lab before (or between) deployments: jump host
+#                     tools, nkp_lab.py self-test, bundle, Prism Central login and inventory, IP plan dry run,
+#                     lab DNS, capacity, REGISTRY_MIRROR_URL, and the management cluster if it exists.
+#                     Changes nothing; exit 1 if any check fails. Report: <workdir>/lab-check.txt.
 #   --status          Show what is still not ready on a cluster this script already created.
 #   --workload        Create a workload (managed) cluster on the management cluster this script
 #                     created: it attaches to a workspace you choose. Run after the management cluster is up.
@@ -88,6 +93,7 @@ DO_SETUP=1
 PRINT_ONLY=0
 FORCE_INSECURE=0
 STATUS_ONLY=0
+CHECK=0
 WORKLOAD=0
 LAB=0
 UNATTENDED=0
@@ -145,6 +151,7 @@ parse_args() {
       --print-only)   PRINT_ONLY=1 ;;
       --insecure)     FORCE_INSECURE=1 ;;
       --status)       STATUS_ONLY=1 ;;
+      --check)        CHECK=1 ;;
       --workload)     WORKLOAD=1 TMUX_SESSION=nkp-workload ;;
       --harbor)       HARBOR_ONLY=1 TMUX_SESSION=nkp-harbor ;;
       --lab)          LAB=1 ;;
@@ -2238,10 +2245,361 @@ phase_destroy() {
   ok "Answers, IP plan and Harbor push record moved to ${archive}"
 }
 
+# ---------------------------------------------------------------------------
+# --check: read-only readiness tests for a real lab (nothing is created or changed)
+# ---------------------------------------------------------------------------
+
+CHECK_RESULTS=()
+CHECK_PY=0
+
+res() { # PASS|WARN|FAIL|SKIP "check" "detail"
+  local c=$C_G
+  case $1 in WARN) c=$C_Y ;; FAIL) c=$C_R ;; SKIP) c="" ;; esac
+  printf '    %s%-4s%s  %-28s %s\n' "$c" "$1" "$C_0" "$2" "$3" >&2
+  CHECK_RESULTS+=("$1  $2: $3")
+}
+
+check_host() {
+  step "Jump host"
+  local mem_kb free_kb cpus v help
+  if [[ $(uname -s) != Linux ]]; then
+    res WARN "Operating system" "$(uname -s); NKP needs a Linux jump host"
+  elif [[ $(stat -fc %T /sys/fs/cgroup 2>/dev/null || true) == cgroup2fs ]]; then
+    res PASS "cgroups v2" "enabled"
+  else
+    res FAIL "cgroups v2" "not enabled; the setup (without --check) configures it"
+  fi
+  if [[ -r /proc/meminfo ]]; then
+    cpus=$(nproc) mem_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    if ((cpus >= 4)); then res PASS "CPUs" "$cpus"; else res WARN "CPUs" "${cpus}; the bootstrap cluster needs 4"; fi
+    if ((mem_kb >= 4 * 1024 * 1024)); then res PASS "Available memory" "$((mem_kb / 1024 / 1024)) GiB"
+    else res WARN "Available memory" "$((mem_kb / 1024)) MiB; the bootstrap cluster needs 4 GiB"; fi
+  fi
+  free_kb=$(df -Pk /var/lib 2>/dev/null | awk 'NR==2 {print $4}' || true)
+  if [[ -n $free_kb ]]; then
+    if ((free_kb >= 30 * 1024 * 1024)); then res PASS "Free space /var/lib" "$((free_kb / 1024 / 1024)) GiB"
+    else res WARN "Free space /var/lib" "$((free_kb / 1024 / 1024)) GiB; 30 GiB or more recommended (Docker images)"; fi
+  fi
+  if command -v python3 >/dev/null && python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null; then
+    CHECK_PY=1
+    res PASS "python3" "$(python3 -c 'import platform; print(platform.python_version())')"
+  else
+    res FAIL "python3" "3.9 or newer is needed for nkp_lab.py; run the setup with --prereqs-only"
+  fi
+  if docker info >/dev/null 2>&1; then
+    v=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "?")
+    if [[ $v == "$DOCKER_VERSION" ]]; then res PASS "Docker" "$v"; else res WARN "Docker" "${v}; NKP ${NKP_MINOR} is tested with ${DOCKER_VERSION}"; fi
+  elif command -v docker >/dev/null; then
+    res FAIL "Docker" "installed, but this user cannot reach the daemon (docker group? log out and in)"
+  else
+    res FAIL "Docker" "not installed; run the setup with --prereqs-only"
+  fi
+  if command -v kubectl >/dev/null; then res PASS "kubectl" "$(kubectl version --client 2>/dev/null | head -1 || true)"
+  else res FAIL "kubectl" "not installed; run the setup with --prereqs-only"; fi
+  if command -v nkp >/dev/null; then
+    v=$(nkp version 2>&1 | head -1 || true)
+    if [[ $v == *"$NKP_MINOR"* ]]; then res PASS "nkp CLI" "$v"; else res FAIL "nkp CLI" "${v:-no version}; expected ${NKP_MINOR}.x"; fi
+    help=$(nkp create cluster nutanix --help 2>&1 || true)
+    if [[ $help == *--bundle* && $help == *--registry-mirror-url* ]]; then res PASS "nkp create flags" "--bundle, --registry-mirror-url"
+    else res FAIL "nkp create flags" "no --bundle or --registry-mirror-url in 'nkp create cluster nutanix --help'"; fi
+    help=$(nkp push bundle --help 2>&1 || true)
+    if [[ $help == *--to-registry* ]]; then res PASS "nkp push bundle" "--to-registry available"
+    else res FAIL "nkp push bundle" "no --to-registry in 'nkp push bundle --help'"; fi
+  else
+    res FAIL "nkp CLI" "not on PATH; run the setup with --prereqs-only --package <nkp-bundle_*.tar.gz>"
+  fi
+  if command -v tmux >/dev/null; then res PASS "tmux" "installed"; else res WARN "tmux" "missing; long runs stop if SSH drops"; fi
+  v=${SSH_PUBLIC_KEY:-${HOME}/.ssh/id_ed25519.pub}
+  if [[ -r $v ]]; then res PASS "SSH public key" "$v"; else res WARN "SSH public key" "${v} missing; the setup generates it"; fi
+}
+
+check_selftest() {
+  step "nkp_lab.py self-test (offline)"
+  local dir out
+  dir=$(dirname "$SCRIPT_PATH")
+  if ((!CHECK_PY)); then res SKIP "Self-test" "no python3"; return 0; fi
+  if [[ ! -r $dir/test_nkp_lab.py ]]; then res WARN "Self-test" "test_nkp_lab.py is not next to the script"; return 0; fi
+  if out=$(cd "$dir" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_nkp_lab 2>&1); then
+    res PASS "Self-test" "$(grep -m1 '^Ran ' <<<"$out" || echo ok)"
+  else
+    res FAIL "Self-test" "$(grep -m1 -E '^(FAILED|Ran )' <<<"$out" || echo failed)"
+    grep -E '^(FAIL|ERROR):' <<<"$out" | head -5 | sed 's/^/          /' >&2 || true
+  fi
+}
+
+check_bundle() {
+  step "Image bundle"
+  local dir files parts f kb=0 free_kb errf
+  if [[ ${USE_BUNDLE:-} == N ]]; then res SKIP "Bundle" "USE_BUNDLE=N: images come from the internet"; return 0; fi
+  dir=${BUNDLE_DIR_ARG:-${BUNDLE_DIR:-}}
+  [[ -n $dir && -d $dir ]] || dir=$(bundle_candidates | awk 'NR == 1')
+  if [[ -z $dir ]]; then
+    if [[ ${USE_BUNDLE:-} == Y ]]; then res FAIL "Bundle" "USE_BUNDLE=Y, but no nkp-v${NKP_MINOR}.x/container-images found (--bundle-dir DIR)"
+    else res WARN "Bundle" "no nkp-v${NKP_MINOR}.x/container-images under ${HOME}/nkp-dist or ${HOME}: images would come from the internet"; fi
+    return 0
+  fi
+  errf=$(mktemp)
+  if files=$(bundle_files "$dir" 2>"$errf"); then
+    IFS=, read -r -a parts <<<"$files"
+    for f in "${parts[@]}"; do kb=$((kb + $(du -kL "$f" | awk '{print $1}'))); done
+    res PASS "Bundle" "${#parts[@]} files, $((kb / 1024 / 1024)) GiB in ${dir}"
+    for f in "${parts[@]}"; do info "            $(basename "$f")"; done
+    free_kb=$(df -Pk /var/lib 2>/dev/null | awk 'NR==2 {print $4}' || true)
+    if [[ -n $free_kb ]] && ((free_kb < kb + 30 * 1024 * 1024)); then
+      res WARN "Space for the bundle" "/var/lib has $((free_kb / 1024 / 1024)) GiB; the bootstrap loads $((kb / 1024 / 1024)) GiB of images"
+    fi
+  else
+    res FAIL "Bundle" "$(tr -s ' \n' ' ' <"$errf")"
+  fi
+  rm -f "$errf"
+}
+
+check_pc() { # -> 1 when the later Prism Central checks cannot run
+  step "Prism Central"
+  local rc=0 code names=() uuids=() name uuid label cidr pools i found="" imgs=() cands=() scs=()
+  if ((!CHECK_PY)); then res SKIP "Prism Central" "no python3"; return 1; fi
+  [[ -n ${NUTANIX_ENDPOINT:-} ]] || { res FAIL "Prism Central" "NUTANIX_ENDPOINT is not set"; return 1; }
+  NUTANIX_ENDPOINT=$(normalize_endpoint "$NUTANIX_ENDPOINT")
+  PC_HOST=${NUTANIX_ENDPOINT#*://} PC_HOST=${PC_HOST%:*}
+  py tls probe "$NUTANIX_ENDPOINT" || rc=$?
+  case $rc in
+    0) res PASS "Reachable, TLS" "${NUTANIX_ENDPOINT}, certificate trusted" ;;
+    1) res WARN "Reachable, TLS" "${NUTANIX_ENDPOINT}, certificate not trusted here (the setup offers insecure or fetching it)" ;;
+    *) res FAIL "Reachable" "cannot connect to ${NUTANIX_ENDPOINT} (routing, firewall, DNS)"; return 1 ;;
+  esac
+  case ${TLS_MODE:-insecure} in
+    trusted) PC_TLS=trusted ;;
+    cafile)  PC_TLS=${PC_CA_FILE:-insecure} ;;
+    *)       PC_TLS=insecure ;;
+  esac
+  NUTANIX_USER=${NUTANIX_USER:-admin}
+  if [[ -z ${NUTANIX_PASSWORD:-} ]] && ((UNATTENDED)); then res FAIL "Login" "export NUTANIX_PASSWORD"; return 1; fi
+  ask_secret NUTANIX_PASSWORD "Prism Central password for ${NUTANIX_USER}"
+  code=$(pc_status /api/nutanix/v3/users/me)
+  if [[ $code != 200 ]]; then res FAIL "Login" "HTTP ${code} for ${NUTANIX_USER}"; return 1; fi
+  res PASS "Login" "as ${NUTANIX_USER}"
+
+  while IFS=$'\t' read -r name uuid; do
+    if [[ -n $name ]]; then names+=("$name"); uuids+=("$uuid"); fi
+  done < <(py pc clusters 2>/dev/null || true)
+  if [[ -z ${NUTANIX_CLUSTER:-} && ${#names[@]} == 1 ]]; then NUTANIX_CLUSTER=${names[0]}; fi
+  for i in "${!names[@]}"; do if [[ ${names[$i]} == "${NUTANIX_CLUSTER:-}" ]]; then PE_UUID=${uuids[$i]}; fi; done
+  if [[ -n $PE_UUID ]]; then res PASS "Prism Element" "$NUTANIX_CLUSTER"
+  else res FAIL "Prism Element" "'${NUTANIX_CLUSTER:-}' not found; clusters: ${names[*]:-none}"; return 1; fi
+
+  names=()
+  while IFS=$'\t' read -r name uuid label cidr pools; do
+    [[ -n $name ]] || continue
+    names+=("$name")
+    if [[ $name == "${SUBNET:-}" || ( -z ${SUBNET:-} && ${name,,} == primary ) ]]; then
+      found=$name SUBNET_UUID=$uuid NODE_CIDR=$cidr NODE_POOLS=$pools
+    fi
+  done < <(py pc subnets "$NUTANIX_CLUSTER" 2>/dev/null || true)
+  if [[ -z $found ]]; then res FAIL "Subnet" "'${SUBNET:-}' not found on ${NUTANIX_CLUSTER}; subnets: ${names[*]:-none}"
+  elif [[ -z $NODE_POOLS ]]; then res WARN "Subnet" "${found} has no IPAM pool: nodes need DHCP, and no IP plan is made"
+  else res PASS "Subnet" "${found}: ${NODE_CIDR}, IPAM pool ${NODE_POOLS}"; fi
+  SUBNET=${found:-${SUBNET:-}}
+
+  mapfile -t imgs < <(py pc images 2>/dev/null || true)
+  if [[ -n ${VM_IMAGE:-} ]]; then
+    if printf '%s\n' "${imgs[@]}" | grep -qxF -- "$VM_IMAGE"; then
+      if [[ $VM_IMAGE == *"$K8S_VERSION_HINT"* ]]; then res PASS "Node image" "$VM_IMAGE"
+      else res WARN "Node image" "${VM_IMAGE} has no ${K8S_VERSION_HINT} in its name; preflight may reject it"; fi
+    else
+      res FAIL "Node image" "'${VM_IMAGE}' not in Prism Central"
+    fi
+  else
+    mapfile -t cands < <(printf '%s\n' "${imgs[@]}" | grep -F -- "$K8S_VERSION_HINT" || true)
+    case ${#cands[@]} in
+      0) res FAIL "Node image" "no image with ${K8S_VERSION_HINT} in its name; upload the NKP Rocky/Ubuntu image" ;;
+      1) res PASS "Node image" "${cands[0]}" ;;
+      *) res WARN "Node image" "${#cands[@]} images match ${K8S_VERSION_HINT}; set VM_IMAGE (${cands[*]})" ;;
+    esac
+  fi
+
+  mapfile -t scs < <(py pc containers "$NUTANIX_CLUSTER" 2>/dev/null || true)
+  if printf '%s\n' "${scs[@]}" | grep -qxF -- "${STORAGE_CONTAINER_NAME:-default}"; then
+    res PASS "Storage container" "${STORAGE_CONTAINER_NAME:-default}"
+  else
+    res FAIL "Storage container" "'${STORAGE_CONTAINER_NAME:-default}' not on ${NUTANIX_CLUSTER}; containers: ${scs[*]:-none}"
+  fi
+
+  if [[ -n ${NTP_SERVERS:-} ]]; then res PASS "NTP" "${NTP_SERVERS} (from the settings)"
+  elif name=$(py pc ntp "$NUTANIX_CLUSTER" 2>/dev/null) && [[ -n $name ]]; then res PASS "NTP" "${name} (from Prism Central)"
+  else res WARN "NTP" "none configured in Prism Central; set NTP_SERVERS or keep the image defaults"; fi
+  return 0
+}
+
+check_ip_plan() {
+  step "IP addresses and DNS (dry run)"
+  local rc=0 f v k r
+  local IP_PLAN_COUNT="" IP_PLAN_BLOCK="" MGMT_CONTROLPLANE_IP="" WL_CONTROLPLANE_IP="" MGMT_LB_RANGE="" WL_LB_RANGE=""
+  local POOLS="" DNS_VM_IP="" DNS_OK=N IP_PLAN_NEW_POOLS IP_PLAN_ORIGINAL_POOLS IP_PLAN_ORIGINAL_DHCP
+  [[ -n $SUBNET_UUID ]] || { res SKIP "IP plan" "no subnet"; return 0; }
+  py_vars pc ip-plan "$SUBNET_UUID" --pc-host "$PC_HOST" --max "$IP_PLAN_MAX" --min "$IP_PLAN_MIN" \
+    --reserve "$IP_PLAN_NODE_RESERVE" --dns-vm "$LAB_DNS_VM" --domain "$LAB_DOMAIN" 2>/dev/null || rc=$?
+  f=$(ip_plan_file)
+  if [[ -f $f && $(ip_plan_get IP_PLAN_SUBNET_UUID) == "$SUBNET_UUID" ]]; then
+    v=$(ip_plan_get IP_PLAN_BLOCK)
+    if [[ -n $NODE_POOLS ]] && ipcalc range_overlaps "$v" "$NODE_POOLS"; then
+      res FAIL "IP plan" "${f}: block ${v} overlaps the IPAM pool ${NODE_POOLS} again"
+    else
+      res PASS "IP plan" "applied earlier: ${v} is outside the IPAM pool"
+    fi
+  elif [[ -n ${CONTROLPLANE_IP:-} ]]; then
+    for k in CONTROLPLANE_IP SERVICE_LB_IP_RANGE WL_CONTROLPLANE_IP WL_LB_RANGE; do
+      v=${!k:-}
+      [[ -n $v ]] || continue
+      r=$v; [[ $r == *-* ]] || r="${r}-${r}"
+      if [[ -n $NODE_CIDR ]] && ! ipcalc range_in_cidr "$r" "$NODE_CIDR"; then res FAIL "$k" "${v} is outside ${NODE_CIDR}"
+      elif [[ -n $NODE_POOLS ]] && ipcalc range_overlaps "$r" "$NODE_POOLS"; then res FAIL "$k" "${v} is inside the IPAM pool ${NODE_POOLS}"
+      elif ip_responds "${r%%-*}"; then res FAIL "$k" "${r%%-*} answers ping: in use"
+      else res PASS "$k" "$v"; fi
+    done
+  else
+    case $rc in
+      0) res PASS "IP plan" "would reserve ${IP_PLAN_BLOCK} (${IP_PLAN_COUNT}): mgmt API ${MGMT_CONTROLPLANE_IP}, LB ${MGMT_LB_RANGE}; workload API ${WL_CONTROLPLANE_IP}, LB ${WL_LB_RANGE}" ;;
+      3) res WARN "IP plan" "no IPAM pool on ${SUBNET}: set CONTROLPLANE_IP, SERVICE_LB_IP_RANGE and the WL_* addresses" ;;
+      4) res FAIL "IP plan" "no run of ${IP_PLAN_MIN} free addresses in ${NODE_POOLS} (keeping ${IP_PLAN_NODE_RESERVE} for nodes)" ;;
+      5) res FAIL "IP plan" "every candidate block has addresses answering ping" ;;
+      *) res FAIL "IP plan" "could not read subnet ${SUBNET}" ;;
+    esac
+  fi
+  if [[ $rc != 0 ]]; then res SKIP "Lab DNS" "not checked"
+  elif [[ -z $DNS_VM_IP ]]; then res WARN "Lab DNS" "no VM named '${LAB_DNS_VM}' with an IPv4 address; the subnet's DNS stays as is"
+  elif [[ $DNS_OK == Y ]]; then res PASS "Lab DNS" "${LAB_DNS_VM} (${DNS_VM_IP}) resolves ${LAB_DOMAIN}"
+  else res WARN "Lab DNS" "${LAB_DNS_VM} (${DNS_VM_IP}) does not resolve ${LAB_DOMAIN} from this host"; fi
+}
+
+# shellcheck disable=SC2030,SC2031  # sizing is computed in subshells so the real answers stay untouched
+check_capacity() {
+  step "Capacity of ${NUTANIX_CLUSTER}"
+  local n=0 c=0 m=0 n2 c2 m2 disk cvm usable what="management + workload"
+  local HOSTS="" CORES=0 HOST_MEM_GIB=0 VM_VCPU=0 VM_MEM_GIB=0 SC_FREE_GIB="" VMS_OK=N
+  [[ -n $PE_UUID ]] || { res SKIP "Capacity" "no Prism Element"; return 0; }
+  if [[ ! -f ${WORKDIR}/${CLUSTER_NAME:-nkp-mgmt}/${CLUSTER_NAME:-nkp-mgmt}.conf ]]; then
+    read -r n c m <<<"$(set +u; SIZING=${SIZING:-pro}; sizing_need)"
+  else
+    what="workload (management cluster exists)"
+  fi
+  read -r n2 c2 m2 <<<"$(set +u; swap_wl; SIZING=${SIZING:-starter}; sizing_need)"
+  n=$((n + n2)) c=$((c + c2)) m=$((m + m2)) disk=$((n * NODE_DISK_GIB))
+  if [[ ${USE_BUNDLE:-} != N || -n ${REGISTRY_MIRROR_URL:-} ]]; then disk=$((disk + HARBOR_DISK_GIB)); fi
+  py_vars pc capacity "$PE_UUID" "${STORAGE_CONTAINER_NAME:-default}" 2>/dev/null || true
+  if [[ -z $HOSTS ]] || ((HOSTS == 0 || HOST_MEM_GIB == 0)); then res WARN "Capacity" "could not read the hosts of ${NUTANIX_CLUSTER}"; return 0; fi
+  cvm=$((HOSTS * CVM_RESERVE_GIB))
+  usable=$(((HOST_MEM_GIB - VM_MEM_GIB - cvm) * 90 / 100))
+  info "${what}: ${n} VMs, ${c} vCPU, ${m} GiB memory, ${disk} GiB disk"
+  if ((m <= usable)); then res PASS "Memory" "${m} GiB needed, about ${usable} GiB free (${HOSTS} hosts, CVMs and 10% kept)"
+  else res FAIL "Memory" "${m} GiB needed, about ${usable} GiB free; choose a smaller size or free memory"; fi
+  if ((CORES > 0 && VM_VCPU + c > CORES * 4)); then res WARN "vCPU" "overcommit $(((VM_VCPU + c) / CORES)):1 on ${CORES} cores"
+  else res PASS "vCPU" "$((VM_VCPU + c)) on ${CORES} cores"; fi
+  if [[ -z $SC_FREE_GIB ]]; then res WARN "Storage" "could not read the free space of ${STORAGE_CONTAINER_NAME:-default}"
+  elif ((disk > SC_FREE_GIB)); then res WARN "Storage" "up to ${disk} GiB (thin), about ${SC_FREE_GIB} GiB free"
+  else res PASS "Storage" "up to ${disk} GiB, about ${SC_FREE_GIB} GiB free"; fi
+}
+
+check_registry() {
+  step "Registry ${REGISTRY_MIRROR_URL}"
+  local proj repos who
+  if ((!CHECK_PY)); then res SKIP "Registry" "no python3"; return 0; fi
+  HARBOR_URL=${REGISTRY_MIRROR_URL%/} HARBOR_CACERT=${REGISTRY_MIRROR_CACERT:-} HARBOR_USER=${REGISTRY_MIRROR_USERNAME:-admin}
+  if [[ -n $HARBOR_CACERT && ! -r $HARBOR_CACERT ]]; then res FAIL "Registry CA" "cannot read ${HARBOR_CACERT}"; return 0; fi
+  if hpy ping 2>/dev/null; then res PASS "Registry reachable" "${HARBOR_URL}${HARBOR_CACERT:+ (CA ${HARBOR_CACERT})}"
+  else res FAIL "Registry reachable" "${HARBOR_URL} does not answer, or its certificate does not match ${HARBOR_CACERT:-the system trust store}"; return 0; fi
+  if [[ -z ${REGISTRY_MIRROR_PASSWORD:-} ]] && ((UNATTENDED)); then res SKIP "Registry login" "export REGISTRY_MIRROR_PASSWORD"; return 0; fi
+  ask_secret REGISTRY_MIRROR_PASSWORD "Password of ${HARBOR_USER} on ${HARBOR_URL}"
+  HARBOR_PASSWORD=$REGISTRY_MIRROR_PASSWORD
+  if who=$(hpy whoami 2>/dev/null); then res PASS "Registry login" "as ${who:-$HARBOR_USER}"
+  else res FAIL "Registry login" "${HARBOR_USER} rejected"; return 0; fi
+  proj=$(harbor_project "$HARBOR_URL")
+  if [[ -z $proj ]]; then res FAIL "Registry project" "${HARBOR_URL} has no project path (e.g. .../nkp)"
+  elif repos=$(hpy repos "$proj" 2>/dev/null); then res PASS "Registry project" "${proj}: ${repos} repositories"
+  else res WARN "Registry project" "${proj} does not exist yet; the push creates it"; fi
+}
+
+check_mgmt() {
+  local m=${CLUSTER_NAME:-nkp-mgmt} kcfg out rc=0 ca
+  local CNPG_APP="" HARBOR_APP="" ROOK_ENABLED=N ROOK_OVERRIDES="" OBJECT_STORE=N NCR_HOST="" NCR_PRESENT=N NCR_CA_FOUND=N
+  kcfg="${WORKDIR}/${m}/${m}.conf"
+  step "Management cluster ${m}"
+  if [[ ! -f $kcfg ]]; then res SKIP "Management cluster" "not created yet (${kcfg})"; return 0; fi
+  if ((!CHECK_PY)); then res SKIP "Management cluster" "no python3"; return 0; fi
+  if out=$(py k8s clusters --kubeconfig "$kcfg" 2>/dev/null); then res PASS "Kubernetes API" "$(grep -c . <<<"$out") Cluster API clusters"
+  else res FAIL "Kubernetes API" "cannot reach ${m} with ${kcfg}"; return 0; fi
+  out=$(helmreleases_not_ready "$kcfg" kommander) || rc=$?
+  if ((rc)); then res WARN "Platform apps" "no HelmReleases in kommander yet"
+  elif [[ -z $out ]]; then res PASS "Platform apps" "all HelmReleases in kommander Ready"
+  else res WARN "Platform apps" "not Ready: $(cut -f1 <<<"$out" | paste -sd' ' -)"; fi
+  py_vars k8s harbor-prereqs --kubeconfig "$kcfg" 2>/dev/null || true
+  if [[ -n $NCR_HOST ]]; then res PASS "Ingress" "$NCR_HOST"; else res FAIL "Ingress" "no address in kommandercluster status yet"; fi
+  if [[ $NCR_PRESENT == Y ]]; then
+    ca=$(mktemp)
+    py_vars k8s ncr --kubeconfig "$kcfg" --ca-out "$ca" 2>/dev/null || true
+    HARBOR_URL="https://${NCR_HOST}:${NCR_PORT}/${HARBOR_PROJECT}" HARBOR_CACERT=$ca
+    if hpy ping 2>/dev/null; then res PASS "Harbor" "running, answers at ${HARBOR_URL}"
+    else res FAIL "Harbor" "secret in ncr-system exists, but ${HARBOR_URL} does not answer with the ingress CA"; fi
+    rm -f "$ca"
+  elif [[ -z ${REGISTRY_MIRROR_URL:-} ]]; then
+    if [[ -n $CNPG_APP && -n $HARBOR_APP ]]; then res PASS "Harbor apps" "${CNPG_APP}, ${HARBOR_APP} (not deployed yet)"
+    else res FAIL "Harbor apps" "missing ClusterApp: ${CNPG_APP:-cloudnative-pg} ${HARBOR_APP:-harbor}"; fi
+    if [[ $ROOK_ENABLED != Y ]]; then res WARN "Rook Ceph" "rook-ceph-cluster is not enabled; Harbor needs S3 storage"
+    elif [[ -n $ROOK_OVERRIDES ]]; then res WARN "Rook Ceph" "already has overrides (${ROOK_OVERRIDES}); not enlarged to ${CEPH_OSD_COUNT} volumes"
+    else res PASS "Rook Ceph" "enabled; the deploy raises it to ${CEPH_OSD_COUNT} x 40 GiB"; fi
+    if [[ -n $HARBOR_OVERRIDES_FILE ]]; then res PASS "Harbor values" "$HARBOR_OVERRIDES_FILE"
+    elif [[ $OBJECT_STORE == Y ]]; then res PASS "Object store" "storage class dkp-object-store"
+    else res WARN "Object store" "no storage class dkp-object-store; set HARBOR_OVERRIDES_FILE"; fi
+  fi
+  if [[ -f $(harbor_marker "$m") ]]; then
+    res PASS "Bundle pushed" "$(harbor_marker_get "$m" HARBOR_URL) on $(harbor_marker_get "$m" PUSH_DATE)"
+  else
+    res WARN "Bundle pushed" "not yet; the setup or --harbor pushes it, otherwise workload clusters pull from the internet"
+  fi
+}
+
+phase_check() {
+  local src="" f passes warns fails
+  step "NKP ${NKP_MINOR} lab check (read-only: nothing is created or changed)"
+  if [[ -n $CONFIG_FILE ]]; then src=$CONFIG_FILE
+  elif [[ -f ${WORKDIR}/nkp-install.env ]]; then src=${WORKDIR}/nkp-install.env
+  elif [[ -f ./nkp-lab.env ]]; then src=$(readlink -f ./nkp-lab.env); fi
+  if [[ -n $src ]]; then
+    # shellcheck disable=SC1090
+    . "$src"
+    info "Settings from ${src}"
+  else
+    warn "No --config, ${WORKDIR}/nkp-install.env or ./nkp-lab.env: only the jump host and the bundle are checked."
+  fi
+  CHECK_RESULTS=() PE_UUID="" SUBNET_UUID="" NODE_POOLS="" NODE_CIDR=""
+  check_host
+  check_selftest
+  check_bundle
+  if [[ -n $src ]] && check_pc; then
+    check_ip_plan
+    check_capacity
+  fi
+  if [[ -n ${REGISTRY_MIRROR_URL:-} ]]; then check_registry; fi
+  if [[ -n $src ]]; then check_mgmt; fi
+
+  passes=$(printf '%s\n' "${CHECK_RESULTS[@]}" | grep -c '^PASS' || true)
+  warns=$(printf '%s\n' "${CHECK_RESULTS[@]}" | grep -c '^WARN' || true)
+  fails=$(printf '%s\n' "${CHECK_RESULTS[@]}" | grep -c '^FAIL' || true)
+  mkdir -p "$WORKDIR" && chmod 700 "$WORKDIR"
+  f="${WORKDIR}/lab-check.txt"
+  (umask 077; { echo "NKP ${NKP_MINOR} lab check $(date '+%F %T'), settings: ${src:-none}"; printf '%s\n' "${CHECK_RESULTS[@]}"; } >"$f")
+  step "Result: ${passes} passed, ${warns} warnings, ${fails} failed (report: ${f})"
+  if ((fails)); then
+    printf '%s\n' "${CHECK_RESULTS[@]}" | grep '^FAIL' | sed 's/^FAIL  /    - /' >&2
+    exit 1
+  fi
+  if ((warns)); then ok "Ready to deploy; review the warnings above."; else ok "Ready to deploy."; fi
+}
+
 main() {
   parse_args "$@"
   if ((INIT_CONFIG)); then init_config; return 0; fi
   [[ -r $PY_HELPER ]] || die "Missing ${PY_HELPER}: keep nkp_lab.py next to this script."
+  if ((CHECK)); then phase_check; return 0; fi
   if ((STATUS_ONLY)); then phase_status; return 0; fi
   if ((DESTROY)); then phase_destroy; return 0; fi
   if ((WORKLOAD)); then phase_workload; return 0; fi
