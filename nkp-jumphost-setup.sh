@@ -12,14 +12,19 @@
 #         waits until the cluster has joined the workspace and its platform applications are ready.
 # --lab   does all of it in one go: every question up front, then the management cluster and the first
 #         workload cluster unattended, ending with lab-summary.txt.
-# Images: with the air-gapped bundle (nkp-air-gapped-bundle_*) extracted, the management cluster is
-#         created with --bundle, which seeds its internal registry (Harbor, namespace ncr-system); workload
-#         clusters then pull from that registry instead of Docker Hub. Images outside the bundle still
-#         come from the internet.
+# Images: with an NKP package extracted (nkp-v2.19.x/container-images), the management cluster is
+#         created with --bundle (its internal registry mirror). The script then deploys Harbor on it as in
+#         the NKP guide (CloudNativePG, Rook Ceph raised to 8 x 40 GiB, namespace ncr-system), pushes the
+#         bundles into Harbor project "nkp" with `nkp push bundle`, and creates every workload cluster with
+#         --registry-mirror-url=https://<ingress>:5000/nkp and a pull-only robot account per cluster.
+#         With REGISTRY_MIRROR_URL set (e.g. https://registry.ntnxlab.local/nkp), that registry is used
+#         instead and no Harbor is deployed. HARBOR_OVERRIDES_FILE=values.yaml replaces the built-in Harbor
+#         values. Prism Central, Kubernetes and Harbor API calls are in nkp_lab.py (keep it next to this script).
 #
 # Usage:
 #   ./nkp-jumphost-setup.sh --lab [--config nkp-lab.env]
 #   ./nkp-jumphost-setup.sh [--package nkp-bundle_v2.19.x_linux_amd64.tar.gz] [options]
+#   ./nkp-jumphost-setup.sh --harbor
 #   ./nkp-jumphost-setup.sh --workload
 #   ./nkp-jumphost-setup.sh --destroy
 #
@@ -27,8 +32,8 @@
 #   --package PATH    NKP package from the Nutanix Portal (nkp_*, nkp-bundle_* or
 #                     nkp-air-gapped-bundle_*.tar.gz). Auto-detected in the current
 #                     directory, $HOME and $HOME/Downloads when omitted.
-#   --bundle-dir DIR  container-images directory of the extracted air-gapped bundle. Default: found
-#                     under $HOME/nkp-dist, where --package extracts nkp-air-gapped-bundle_*.
+#   --bundle-dir DIR  container-images directory of an extracted NKP package. Default: the newest
+#                     nkp-v2.19.x/container-images under $HOME/nkp-dist (where --package extracts) or $HOME.
 #   --workdir DIR     Where answers, logs and the kubeconfig are kept (default: $HOME/nkp).
 #   --prereqs-only    Run phase 1 only.
 #   --skip-prereqs    Run phase 2 only.
@@ -37,6 +42,8 @@
 #   --status          Show what is still not ready on a cluster this script already created.
 #   --workload        Create a workload (managed) cluster on the management cluster this script
 #                     created: it attaches to a workspace you choose. Run after the management cluster is up.
+#   --harbor          Deploy Harbor on the management cluster (if missing) and push the bundle into it;
+#                     skipped when that cluster already has these bundles. Runs after the management cluster.
 #   --lab             Prerequisites, management cluster and first workload cluster in one run.
 #   --config FILE     Answers file (see --init-config) used as defaults; with --unattended, as the answers.
 #   --init-config     Write a commented answers template to ./nkp-lab.env and exit.
@@ -49,7 +56,7 @@
 #   -h, --help        Show this help.
 #
 # Passwords are not saved in the answers file; to skip their prompts, export NUTANIX_PASSWORD,
-# DOCKERHUB_PASSWORD and NUTANIX_REGISTRY_PASSWORD (optional with the bundle) before running. The preflight dry-run manifest (cluster-dryrun.yaml,
+# DOCKERHUB_PASSWORD, NUTANIX_REGISTRY_PASSWORD (optional with the bundle) and REGISTRY_MIRROR_PASSWORD before running. The preflight dry-run manifest (cluster-dryrun.yaml,
 # mode 600) does contain the credentials, because nkp renders them into Kubernetes secrets. If the jump host reaches the internet through a proxy,
 # configure apt/dnf for it and export HTTP_PROXY/HTTPS_PROXY/NO_PROXY before running.
 
@@ -57,7 +64,9 @@
 set -Eeuo pipefail
 
 SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+PY_HELPER="$(dirname "$SCRIPT_PATH")/nkp_lab.py"
 ORIG_ARGS=("$@")
+PC_TLS=insecure
 
 NKP_MINOR="2.19"
 DOCKER_VERSION="27.4.0"
@@ -68,7 +77,9 @@ DOCKERHUB_URL="https://registry-1.docker.io"
 NUTANIX_REGISTRY_DEFAULT_USER="svcregistrynkp"
 MIN_WORKERS=4  # two 4 vCPU workers (the documented Starter minimum) leave Kommander apps Pending on CPU
 NCR_PORT=5000
-HARBOR_DISK_GIB=100  # internal registry storage recommended by the NKP docs
+CEPH_OSD_DEFAULT=4   # Rook Ceph volumes (40 GiB each) of a default management cluster, about 120 GiB usable
+CEPH_OSD_COUNT=8     # raised for Harbor, which needs about 100 GiB (NKP 2.19 "Increasing Rook Ceph Storage Capacity")
+HARBOR_DISK_GIB=$(((CEPH_OSD_COUNT - CEPH_OSD_DEFAULT) * 40))
 
 PACKAGE=""
 WORKDIR="${HOME}/nkp"
@@ -95,9 +106,15 @@ MGMT_USE_BUNDLE=N
 BUNDLE_DIR_ARG=""
 BUNDLE_ARGS=()
 BUNDLE_COUNT=0
+BUNDLE_FILES=""
 REGISTRY_MIRROR_ARGS=()
 NCR_URL=""
 NCR_AUTH=""
+NCR_CACERT=""
+HARBOR_ONLY=0
+HARBOR_PROJECT=nkp
+HARBOR_OVERRIDES_FILE=${HARBOR_OVERRIDES_FILE:-}  # Harbor AppDeployment values (YAML) instead of the built-in Rook Ceph S3 ones
+HARBOR_URL="" HARBOR_CACERT="" HARBOR_USER="" HARBOR_PASSWORD="" HARBOR_EXTERNAL=N
 
 if [[ -t 1 ]]; then
   C_B=$'\e[1m' C_G=$'\e[32m' C_Y=$'\e[33m' C_R=$'\e[31m' C_C=$'\e[36m' C_0=$'\e[0m'
@@ -129,6 +146,7 @@ parse_args() {
       --insecure)     FORCE_INSECURE=1 ;;
       --status)       STATUS_ONLY=1 ;;
       --workload)     WORKLOAD=1 TMUX_SESSION=nkp-workload ;;
+      --harbor)       HARBOR_ONLY=1 TMUX_SESSION=nkp-harbor ;;
       --lab)          LAB=1 ;;
       --config)       CONFIG_FILE=${2:?--config needs a file}; shift ;;
       --init-config)  INIT_CONFIG=1 ;;
@@ -144,6 +162,10 @@ parse_args() {
   if [[ -n $BUNDLE_DIR_ARG ]]; then
     [[ -d $BUNDLE_DIR_ARG ]] || die "--bundle-dir: ${BUNDLE_DIR_ARG} is not a directory."
     BUNDLE_DIR_ARG=$(readlink -f "$BUNDLE_DIR_ARG")
+  fi
+  if [[ -n $HARBOR_OVERRIDES_FILE ]]; then
+    [[ -r $HARBOR_OVERRIDES_FILE ]] || die "Cannot read HARBOR_OVERRIDES_FILE ${HARBOR_OVERRIDES_FILE}."
+    HARBOR_OVERRIDES_FILE=$(readlink -f "$HARBOR_OVERRIDES_FILE")
   fi
   if [[ -n $CONFIG_FILE ]]; then
     [[ -r $CONFIG_FILE ]] || die "Cannot read the config file ${CONFIG_FILE}."
@@ -189,7 +211,7 @@ init_config() {
 # NKP lab answers for nkp-jumphost-setup.sh --lab --config nkp-lab.env [--unattended]
 # Blank values fall back to the script's defaults or are discovered from Prism Central.
 # Passwords are never read from this file: export NUTANIX_PASSWORD and NUTANIX_REGISTRY_PASSWORD
-# (the registry token is optional when the bundle seeds the internal registry).
+# (the registry token is optional when the bundle seeds the internal registry), and REGISTRY_MIRROR_PASSWORD.
 
 # Management cluster
 CLUSTER_NAME=nkp-mgmt
@@ -223,10 +245,16 @@ PROXY_NO=
 NTP_SERVERS=                      # blank = Prism Central's NTP servers
 ONBOARD_PC=Y
 
-# Images: seed the management cluster's internal registry from the extracted air-gapped bundle
-USE_BUNDLE=                       # Y | N; blank = Y when an extracted nkp-air-gapped-bundle is found
-BUNDLE_DIR=                       # blank = ~/nkp-dist/nkp-air-gapped-bundle_v2.19.*/nkp-v*/container-images
-USE_NDK_BUNDLE=N                  # Y also pushes ndk-*.tar (put it in BUNDLE_DIR); only if you deploy NDK
+# Images: seed the management cluster's Harbor from the extracted NKP package
+USE_BUNDLE=                       # Y | N; blank = Y when an extracted nkp-v2.19.x/container-images is found
+BUNDLE_DIR=                       # blank = newest nkp-v2.19.*/container-images under ~/nkp-dist or ~
+USE_CATALOG_BUNDLES=Y             # also the *catalog*.tar bundles (AI applications, Nutanix product catalog)
+
+# Workload clusters pull from the management cluster's Harbor. Blank URL = its internal address
+# (:5000) with a robot account. With a URL, the bundle is pushed there once; export REGISTRY_MIRROR_PASSWORD.
+REGISTRY_MIRROR_URL=              # e.g. https://registry.ntnxlab.local/nkp
+REGISTRY_MIRROR_USERNAME=         # pushes as this user (blank = admin); workload clusters get a robot account
+REGISTRY_MIRROR_CACERT=           # CA certificate file of that endpoint; blank = the system trust store
 
 # Lab network: DNS server VM and domain handed out by the subnet's DHCP
 LAB_DNS_VM=autoad
@@ -353,45 +381,21 @@ pick() { # VAR "Prompt" values_array [labels_array]
 # Validators
 # ---------------------------------------------------------------------------
 
-ipcalc() { # op args... -> exit status
-  python3 - "$@" <<'PY'
-import ipaddress, sys
-op, *a = sys.argv[1:]
-def rng(s):
-    lo, hi = (ipaddress.ip_address(x.strip()) for x in s.split("-", 1))
-    if hi < lo:
-        raise ValueError
-    return lo, hi
-def rngs(s):
-    return [rng(x) for x in s.split(",") if x.strip()]
-try:
-    if op == "ip":
-        ipaddress.ip_address(a[0]); ok = True
-    elif op == "cidr":
-        ipaddress.ip_network(a[0], strict=False); ok = "/" in a[0]
-    elif op == "range":
-        rng(a[0]); ok = True
-    elif op == "ip_in_cidr":
-        ok = ipaddress.ip_address(a[0]) in ipaddress.ip_network(a[1], strict=False)
-    elif op == "range_in_cidr":
-        n = ipaddress.ip_network(a[1], strict=False); lo, hi = rng(a[0]); ok = lo in n and hi in n
-    elif op == "ip_in_ranges":
-        ip = ipaddress.ip_address(a[0]); ok = any(lo <= ip <= hi for lo, hi in rngs(a[1]))
-    elif op == "range_in_ranges":
-        lo, hi = rng(a[0]); ok = any(l <= lo and hi <= h for l, h in rngs(a[1]))
-    elif op == "range_overlaps":
-        lo, hi = rng(a[0]); ok = any(lo <= h and l <= hi for l, h in rngs(a[1]))
-    elif op == "cidr_overlap":
-        ok = ipaddress.ip_network(a[0], strict=False).overlaps(ipaddress.ip_network(a[1], strict=False))
-    elif op == "range_first":
-        print(rng(a[0])[0]); ok = True
-    else:
-        ok = False
-except (ValueError, IndexError, TypeError):
-    ok = False
-sys.exit(0 if ok else 1)
-PY
+py() { # nkp_lab.py with the Prism Central login in its environment (never on the command line)
+  NKP_PC_ENDPOINT="${NUTANIX_ENDPOINT:-}" NKP_PC_USER="${NUTANIX_USER:-}" NKP_PC_PASSWORD="${NUTANIX_PASSWORD:-}" \
+    NKP_PC_TLS="${PC_TLS:-insecure}" NKP_CACHE="${WORKDIR}/cache" python3 "$PY_HELPER" "$@"
 }
+
+py_vars() { # nkp_lab.py command printing KEY=value lines -> sets those variables; returns its exit status
+  local __out __k __v __rc=0
+  __out=$(py "$@") || __rc=$?
+  while IFS='=' read -r __k __v; do
+    if [[ $__k =~ ^[A-Z_][A-Z0-9_]*$ ]]; then printf -v "$__k" '%s' "$__v"; fi
+  done <<<"$__out"
+  return "$__rc"
+}
+
+ipcalc() { py ip "$@"; } # op args... -> exit status; range_first prints the first address
 
 v_cluster_name() {
   if [[ $1 =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] && ((${#1} <= 58)); then return 0; fi
@@ -699,20 +703,7 @@ ensure_tmux_session() {
   ask_yn "Continue here without tmux?" N || exit 0
 }
 
-cfg_escape() { local s=${1//\\/\\\\}; printf '%s' "${s//\"/\\\"}"; }
-
-pc_curl() {
-  printf 'user = "%s:%s"\n' "$(cfg_escape "$NUTANIX_USER")" "$(cfg_escape "$NUTANIX_PASSWORD")" \
-    | curl -K - -sS --max-time 30 "${PC_TLS_ARGS[@]}" -H 'Accept: application/json' "$@"
-}
-
-pc_api() { # METHOD PATH [JSON]
-  local extra=()
-  if [[ -n ${3-} ]]; then extra=(-H 'Content-Type: application/json' --data "$3"); fi
-  pc_curl --fail -X "$1" "${extra[@]}" "${NUTANIX_ENDPOINT}$2"
-}
-
-pc_status() { pc_curl -o /dev/null -w '%{http_code}' "${NUTANIX_ENDPOINT}$1" 2>/dev/null || true; }
+pc_status() { py pc status "$1" 2>/dev/null || echo 000; }
 
 normalize_endpoint() {
   local e=${1%/} hostport
@@ -740,7 +731,8 @@ save_answers() {
              VM_IMAGE STORAGE_CONTAINER_NAME CONTROLPLANE_IP SERVICE_LB_IP_RANGE POD_CIDR SERVICE_CIDR SIZING \
              CP_REPLICAS CP_VCPUS CP_MEMORY WK_REPLICAS WK_VCPUS WK_MEMORY SSH_USERNAME SSH_PUBLIC_KEY \
              USE_DOCKERHUB DOCKERHUB_USERNAME NUTANIX_REGISTRY_USERNAME USE_PROXY PROXY_HTTP PROXY_HTTPS PROXY_NO NTP_SERVERS ONBOARD_PC \
-             USE_BUNDLE BUNDLE_DIR USE_NDK_BUNDLE USE_MGMT_REGISTRY; do
+             USE_BUNDLE BUNDLE_DIR USE_CATALOG_BUNDLES USE_MGMT_REGISTRY \
+             REGISTRY_MIRROR_URL REGISTRY_MIRROR_USERNAME REGISTRY_MIRROR_CACERT; do
       printf '%s=%q\n' "$k" "${!k:-}"
     done
   } >"$ANSWERS_FILE"
@@ -751,8 +743,8 @@ v_workload_name() {
   v_cluster_name "$1" || return 1
   if [[ $1 == "$MGMT_CLUSTER_NAME" ]]; then echo "      That is the management cluster's name." >&2; return 1; fi
   local names
-  names=$("${MGMT_K[@]}" get clusters.cluster.x-k8s.io -A -o name 2>/dev/null || true)
-  if grep -qx "cluster.cluster.x-k8s.io/$1" <<<"$names"; then
+  names=$(py k8s clusters --kubeconfig "$MGMT_KCFG" 2>/dev/null | cut -f2 || true)
+  if grep -qxF -- "$1" <<<"$names"; then
     echo "      A cluster named $1 already exists on ${MGMT_CLUSTER_NAME}." >&2; return 1
   fi
 }
@@ -771,59 +763,21 @@ q_cluster() {
 }
 
 use_insecure() {
-  TLS_MODE=insecure PC_TLS_ARGS=(-k) TRUST_ARGS=(--insecure=true)
+  TLS_MODE=insecure PC_TLS=insecure TRUST_ARGS=(--insecure=true)
   warn "NKP will not verify Prism Central's TLS certificate (--insecure)."
 }
 
-fetch_server_cert() { # out_pem -> Prism Central's own (leaf) certificate
-  local hostport=${NUTANIX_ENDPOINT#*://} sni=()
-  if [[ ! $PC_HOST =~ ^[0-9.]+$ ]]; then sni=(-servername "$PC_HOST"); fi
-  openssl s_client "${sni[@]}" -connect "$hostport" </dev/null 2>/dev/null | openssl x509 -outform PEM >"$1"
-}
+fetch_server_cert() { py tls fetch "${NUTANIX_ENDPOINT#*://}" "$1"; } # out_pem -> Prism Central's own (leaf) certificate
 
-cert_covers_host() { # pem host -> 0 issued for host, 1 not issued for host, 2 cannot tell; prints the certificate's names
-  local rc=0
-  python3 - "$1" "$2" 2>/dev/null <<'PY' || rc=$?
-import ipaddress, ssl, sys
-try:
-    sans = ssl._ssl._test_decode_cert(sys.argv[1]).get("subjectAltName", ())
-except Exception:
-    sys.exit(2)
-print(", ".join(f"{k}:{v}" for k, v in sans))
-host = sys.argv[2].lower()
-try:
-    ip = ipaddress.ip_address(host)
-except ValueError:
-    ip = None
-for kind, value in sans:
-    value = value.strip().lower()
-    if ip is not None and kind == "IP Address":
-        try:
-            if ipaddress.ip_address(value) == ip:
-                sys.exit(0)
-        except ValueError:
-            pass
-    elif ip is None and kind == "DNS":
-        if value == host or (value.startswith("*.") and host.partition(".")[2] == value[2:]):
-            sys.exit(0)
-sys.exit(1)
-PY
-  return "$rc"
-}
+cert_covers_host() { py tls covers "$1" "$2" 2>/dev/null; } # pem host -> 0 issued for host, 1 not, 2 cannot tell; prints its names
 
 setup_trust() {
   local rc=0 pem tb_help b64file leaf names
-  PC_TLS_ARGS=()
-  if ((FORCE_INSECURE)); then
-    curl -sk -o /dev/null --max-time 10 "${NUTANIX_ENDPOINT}/" || rc=$?
-    ((rc == 0)) || die "Cannot reach ${NUTANIX_ENDPOINT} (curl exit ${rc}). Check routing, firewall and DNS from the jump host."
-    use_insecure; return
-  fi
-  curl -s -o /dev/null --max-time 10 "${NUTANIX_ENDPOINT}/" || rc=$?
-  case $rc in
-    0) TLS_MODE=trusted; ok "Prism Central certificate is trusted by this host"; return ;;
-    6|7|28) die "Cannot reach ${NUTANIX_ENDPOINT} (curl exit ${rc}). Check routing, firewall and DNS from the jump host." ;;
-  esac
+  PC_TLS=insecure
+  py tls probe "$NUTANIX_ENDPOINT" || rc=$?
+  ((rc != 2)) || die "Cannot reach ${NUTANIX_ENDPOINT}. Check routing, firewall and DNS from the jump host."
+  if ((FORCE_INSECURE)); then use_insecure; return; fi
+  if ((rc == 0)); then TLS_MODE=trusted PC_TLS=trusted; ok "Prism Central certificate is trusted by this host"; return; fi
   warn "Prism Central's certificate is not trusted by this host (typical for the default self-signed certificate)."
   local modes=(insecure fetched cafile)
   local labels=("Skip certificate verification (--insecure; simplest for labs and POCs)"
@@ -840,12 +794,12 @@ setup_trust() {
       fetch_server_cert "$pem" || die "Could not fetch the certificate from ${NUTANIX_ENDPOINT}."
       openssl x509 -in "$pem" -noout -subject -issuer -enddate -fingerprint -sha256 | sed 's/^/      /' >&2
       ask_yn "Trust this certificate?" Y || die "Certificate not trusted. Rerun and choose another option."
-      PC_TLS_ARGS=(-k) leaf=$pem ;;
+      PC_TLS=insecure leaf=$pem ;;
     cafile)
       ask PC_CA_FILE "Path to the CA certificate (PEM)" v_file
       openssl x509 -in "$PC_CA_FILE" -noout >/dev/null 2>&1 || die "${PC_CA_FILE} is not a PEM certificate."
       cp "$PC_CA_FILE" "$pem"
-      PC_TLS_ARGS=(--cacert "$pem") leaf="${CLUSTER_DIR}/prism-central-server.pem"
+      PC_TLS=$pem leaf="${CLUSTER_DIR}/prism-central-server.pem"
       fetch_server_cert "$leaf" || leaf="" ;;
   esac
   # Trusting the issuer is not enough: NKP also requires the certificate to name the address it connects to.
@@ -895,55 +849,39 @@ q_prism_central() {
 
 q_inventory() {
   step "Prism Central resources"
-  local pe_list=() subnets_json="" subnet_vals=() subnet_labels=() img_all=() img_list=() sc_list=() line pools name label
-  CLUSTERS_JSON="" SUBNET_UUID="" PE_UUID=""
+  local pe_names=() pe_uuids=() subnet_vals=() subnet_labels=() subnet_uuids=() subnet_cidrs=() subnet_pools=()
+  local img_all=() img_list=() sc_list=() name uuid label cidr pools i
+  SUBNET_UUID="" PE_UUID=""
   if ((PC_API_OK)); then
-    CLUSTERS_JSON=$(pc_api POST /api/nutanix/v3/clusters/list '{"kind":"cluster","length":500}' 2>/dev/null || true)
-    mapfile -t pe_list < <(jq -r '.entities[] | select((.status.resources.config.service_list // []) | index("PRISM_CENTRAL") | not) | .status.name' \
-      <<<"$CLUSTERS_JSON" 2>/dev/null | sort || true)
+    while IFS=$'\t' read -r name uuid; do
+      if [[ -n $name ]]; then pe_names+=("$name"); pe_uuids+=("$uuid"); fi
+    done < <(py pc clusters 2>/dev/null | sort || true)
   fi
-  pick NUTANIX_CLUSTER "Prism Element cluster for the nodes" pe_list
-  PE_UUID=$(jq -r --arg c "$NUTANIX_CLUSTER" '[.entities[]? | select(.status.name == $c) | .metadata.uuid][0] // empty' \
-    <<<"$CLUSTERS_JSON" 2>/dev/null || true)
+  pick NUTANIX_CLUSTER "Prism Element cluster for the nodes" pe_names
+  for i in "${!pe_names[@]}"; do
+    if [[ ${pe_names[$i]} == "$NUTANIX_CLUSTER" ]]; then PE_UUID=${pe_uuids[$i]}; fi
+  done
 
   if ((PC_API_OK)); then
-    subnets_json=$(pc_api POST /api/nutanix/v3/subnets/list '{"kind":"subnet","length":500}' 2>/dev/null || true)
-    while IFS=$'\t' read -r name label; do
-      if [[ -n $name ]]; then subnet_vals+=("$name"); subnet_labels+=("$label"); fi
-    done < <(jq -r --arg c "$NUTANIX_CLUSTER" '
-        .entities[]?
-        | select(((.status.cluster_reference.name // .spec.cluster_reference.name // "") as $n | $n == $c or $n == ""))
-        | .status.resources.ip_config as $ip
-        | [.status.name,
-           (.status.name + "  (" + (.status.resources.subnet_type // "?")
-             + (if $ip.subnet_ip then ", " + $ip.subnet_ip + "/" + ($ip.prefix_length|tostring) else "" end)
-             + (if ($ip.pool_list // []) | length > 0 then ", pool " + ([$ip.pool_list[].range | gsub(" "; "-")] | join(",")) else ", no IPAM pool" end)
-             + ")")]
-        | @tsv' <<<"$subnets_json" 2>/dev/null || true)
+    while IFS=$'\t' read -r name uuid label cidr pools; do
+      if [[ -n $name ]]; then
+        subnet_vals+=("$name") subnet_uuids+=("$uuid") subnet_labels+=("$label") subnet_cidrs+=("$cidr") subnet_pools+=("$pools")
+      fi
+    done < <(py pc subnets "$NUTANIX_CLUSTER" 2>/dev/null || true)
   fi
   default_match SUBNET subnet_vals '^primary$'
   pick SUBNET "Subnet for control plane and worker nodes (must have IPAM or DHCP)" subnet_vals subnet_labels
 
   NODE_POOLS=""
-  if [[ -n $subnets_json ]]; then
-    SUBNET_UUID=$(jq -r --arg s "$SUBNET" --arg c "$NUTANIX_CLUSTER" '
-        [.entities[]? | select(.status.name == $s)
-         | select(((.status.cluster_reference.name // .spec.cluster_reference.name // "") as $n | $n == $c or $n == ""))][0]
-        | .metadata.uuid // empty' <<<"$subnets_json" 2>/dev/null || true)
-    line=$(jq -r --arg s "$SUBNET" --arg c "$NUTANIX_CLUSTER" '
-        [.entities[]? | select(.status.name == $s)
-         | select(((.status.cluster_reference.name // .spec.cluster_reference.name // "") as $n | $n == $c or $n == ""))][0]
-        | .status.resources.ip_config // {}
-        | if .subnet_ip then "\(.subnet_ip)/\(.prefix_length) \([.pool_list[]?.range | gsub(" "; "-")] | join(","))" else "" end' \
-        <<<"$subnets_json" 2>/dev/null || true)
-    if [[ -n $line ]]; then
-      NODE_CIDR=${line%% *}
-      pools=${line#* }
-      if [[ $pools == "$line" ]]; then pools=""; fi
-      NODE_POOLS=$pools
+  for i in "${!subnet_vals[@]}"; do
+    [[ ${subnet_vals[$i]} == "$SUBNET" ]] || continue
+    SUBNET_UUID=${subnet_uuids[$i]}
+    if [[ -n ${subnet_cidrs[$i]} ]]; then
+      NODE_CIDR=${subnet_cidrs[$i]} NODE_POOLS=${subnet_pools[$i]}
       ok "Subnet ${SUBNET}: ${NODE_CIDR}${NODE_POOLS:+, IPAM pool ${NODE_POOLS}}"
     fi
-  fi
+    break
+  done
   if [[ -z $NODE_POOLS ]]; then
     info "No Nutanix IPAM pool found for ${SUBNET} (external DHCP?). IP checks will use the CIDR only."
     ask NODE_CIDR "Node subnet CIDR, for IP validation (leave blank to skip)" optional
@@ -951,8 +889,7 @@ q_inventory() {
   fi
 
   if ((PC_API_OK)); then
-    mapfile -t img_all < <(pc_api POST /api/nutanix/v3/images/list '{"kind":"image","length":500}' 2>/dev/null \
-      | jq -r '.entities[].status.name' | sort -u || true)
+    mapfile -t img_all < <(py pc images 2>/dev/null || true)
     mapfile -t img_list < <(printf '%s\n' "${img_all[@]}" | grep -F -- "$K8S_VERSION_HINT" || true)
     if ((${#img_list[@]} == 0 && ${#img_all[@]} > 0)); then
       warn "No image name contains Kubernetes ${K8S_VERSION_HINT}; the NKP preflight check expects the version in the name. Showing all images."
@@ -963,10 +900,7 @@ q_inventory() {
   [[ $VM_IMAGE == *"$K8S_VERSION_HINT"* ]] || warn "'${VM_IMAGE}' does not contain ${K8S_VERSION_HINT}; preflight may reject it."
 
   if ((PC_API_OK)); then
-    # shellcheck disable=SC2016
-    mapfile -t sc_list < <(pc_api GET '/api/clustermgmt/v4.0/config/storage-containers?$limit=100' 2>/dev/null \
-      | jq -r --arg c "$NUTANIX_CLUSTER" '.data[]? | select((.clusterName // $c) == $c) | .name
-               | select(. != "NutanixManagementShare" and . != "SelfServiceContainer")' | sort -u || true)
+    mapfile -t sc_list < <(py pc containers "$NUTANIX_CLUSTER" 2>/dev/null || true)
   fi
   default_match STORAGE_CONTAINER_NAME sc_list '^default$'
   default_match STORAGE_CONTAINER_NAME sc_list '^default'
@@ -980,7 +914,6 @@ q_inventory() {
 IP_PLAN_MAX=30           # management API + workload API + two load balancer ranges of 14
 IP_PLAN_MIN=12           # never fewer: 1 + 1 + 5 + 5
 IP_PLAN_NODE_RESERVE=20  # pool addresses left for node VMs (both clusters plus rolling upgrades)
-VMS_FILE=""
 
 ip_plan_file() { printf '%s' "${WORKDIR}/nkp-ip-plan.env"; }
 
@@ -1004,162 +937,11 @@ ip_plan_default() { # VAR KEY: take the plan's value unless VAR already holds ad
   printf -v "$1" '%s' "$val"
 }
 
-load_vms() { # every VM in Prism Central (paged) as one JSON array in VMS_FILE
-  [[ -z $VMS_FILE ]] || return 0
-  local dir offset=0 total=1 n page=0
-  dir=$(mktemp -d)
-  while ((offset < total)); do
-    page=$((page + 1))
-    pc_api POST /api/nutanix/v3/vms/list "{\"kind\":\"vm\",\"length\":250,\"offset\":${offset}}" >"${dir}/${page}.json" 2>/dev/null \
-      || { rm -rf "$dir"; return 1; }
-    total=$(jq -r '.metadata.total_matches // 0' "${dir}/${page}.json")
-    n=$(jq -r '.entities | length' "${dir}/${page}.json")
-    ((n > 0)) || break
-    offset=$((offset + n))
-  done
-  VMS_FILE="${WORKDIR}/pc-vms.json"
-  jq -s '[.[].entities[]?]' "$dir"/*.json >"$VMS_FILE"
-  rm -rf "$dir"
-}
-
-used_ips() { # subnet_json -> addresses in use: VM NICs, Prism Element/Central, hosts, gateway, DHCP server
-  if [[ -n $VMS_FILE ]]; then
-    jq -r '.[] | .status.resources.nic_list[]? | .ip_endpoint_list[]? | .ip // empty' "$VMS_FILE" 2>/dev/null || true
-  fi
-  jq -r '.entities[]? | (.status.resources.network // {}), (.spec.resources.network // {})
-         | .external_ip, .external_data_services_ip | strings' <<<"$CLUSTERS_JSON" 2>/dev/null || true
-  if [[ $PC_HOST =~ ^[0-9.]+$ ]]; then printf '%s\n' "$PC_HOST"; fi
-  pc_api POST /api/nutanix/v3/hosts/list '{"kind":"host","length":500}' 2>/dev/null \
-    | jq -r '.entities[]? | .status.resources | (.hypervisor.ip, .controller_vm.ip, .ipmi.ip) | strings' 2>/dev/null || true
-  jq -r '.spec.resources.ip_config | (.default_gateway_ip, .dhcp_server_address.ip) | strings' <<<"$1" 2>/dev/null || true
-}
-
-ip_select() { # pools(a-b,...) used_file max min node_reserve -> KEY=value plan; exit 1 if no free run of min addresses
-  python3 - "$@" <<'PY'
-import ipaddress, sys
-pools_s, used_f = sys.argv[1], sys.argv[2]
-mx, mn, keep = (int(x) for x in sys.argv[3:6])
-A = ipaddress.ip_address
-pools = []
-for p in pools_s.split(","):
-    if p.strip():
-        lo, hi = (int(A(x.strip())) for x in p.split("-", 1))
-        pools.append((lo, hi))
-used = set()
-for line in open(used_f):
-    try:
-        used.add(int(A(line.strip())))
-    except ValueError:
-        pass
-runs = []  # maximal runs of free addresses inside the pools
-for lo, hi in pools:
-    start = None
-    for ip in range(lo, hi + 1):
-        if ip in used:
-            if start is not None:
-                runs.append((start, ip - 1))
-            start = None
-        elif start is None:
-            start = ip
-    if start is not None:
-        runs.append((start, hi))
-free = sum(hi - lo + 1 for lo, hi in runs)
-runs = [r for r in runs if r[1] - r[0] + 1 >= mn]
-if not runs:
-    sys.exit(1)
-lo, hi = max(runs, key=lambda r: r[1])  # the run closest to the end of the pool
-n = min(mx, hi - lo + 1, free - keep)
-if n < mn:
-    sys.exit(1)
-b = list(range(hi - n + 1, hi + 1))
-s = lambda i: str(A(i))
-half = (n - 2) // 2
-new = []
-for plo, phi in pools:
-    if plo <= b[0] and b[-1] <= phi:
-        if plo < b[0]:
-            new.append((plo, b[0] - 1))
-        if b[-1] < phi:
-            new.append((b[-1] + 1, phi))
-    else:
-        new.append((plo, phi))
-print(f"IP_PLAN_COUNT={n}")
-print(f"IP_PLAN_BLOCK={s(b[0])}-{s(b[-1])}")
-print("IP_PLAN_NEW_POOLS=" + ",".join(f"{s(x)}-{s(y)}" for x, y in new))
-print(f"MGMT_CONTROLPLANE_IP={s(b[0])}")
-print(f"WL_CONTROLPLANE_IP={s(b[1])}")
-print(f"MGMT_LB_RANGE={s(b[2])}-{s(b[1 + half])}")
-print(f"WL_LB_RANGE={s(b[2 + half])}-{s(b[1 + 2 * half])}")
-PY
-}
-
-range_responders() { # a-b -> the addresses in it that answer ping
-  python3 -c 'import ipaddress as i, sys
-lo, hi = (int(i.ip_address(x)) for x in sys.argv[1].split("-"))
-print("\n".join(str(i.ip_address(n)) for n in range(lo, hi + 1)))' "$1" \
-    | xargs -P 32 -I{} sh -c 'ping -c1 -W1 {} >/dev/null 2>&1 && echo {}' | sort -V || true
-}
-
-ranges_to_pools() { jq -nc --arg r "$1" '[$r | split(",")[] | select(length > 0) | {range: sub("-"; " ")}]'; }
-
-lab_dns_ip() { # first IPv4 of the VM named LAB_DNS_VM (exact match preferred, case-insensitive)
-  [[ -n $VMS_FILE ]] || return 0
-  jq -r --arg n "${LAB_DNS_VM,,}" '
-      [.[] | ((.status.name // .spec.name // "") | ascii_downcase) as $vm | select($vm | contains($n))
-       | {exact: ($vm == $n), ip: ([.status.resources.nic_list[]? | .ip_endpoint_list[]? | .ip // empty
-                                   | select(test("^[0-9]+([.][0-9]+){3}$"))][0])}
-       | select(.ip)] | sort_by(.exact | not) | .[0].ip // empty' "$VMS_FILE" 2>/dev/null || true
-}
-
-dns_answers() { # server name -> 0 if the server returns an address for name
-  python3 - "$1" "$2" <<'PY'
-import random, socket, struct, sys
-server, name = sys.argv[1:3]
-qid = random.randint(0, 65535)
-query = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
-query += b"".join(bytes([len(p)]) + p.encode() for p in name.rstrip(".").split(".")) + b"\0"
-query += struct.pack(">HH", 1, 1)
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(3)
-try:
-    s.sendto(query, (server, 53))
-    data = s.recv(4096)
-except OSError:
-    sys.exit(1)
-rid, flags, _, answers = struct.unpack(">HHHH", data[:8])
-sys.exit(0 if rid == qid and flags & 0x000F == 0 and answers > 0 else 1)
-PY
-}
-
-subnet_update() { # JSON body -> PUT it to SUBNET_UUID and wait for the Prism Central task
-  local out code task status i
-  out=$(pc_curl -X PUT -H 'Content-Type: application/json' --data "$1" -w '\n%{http_code}' \
-    "${NUTANIX_ENDPOINT}/api/nutanix/v3/subnets/${SUBNET_UUID}" 2>&1) || true
-  code=${out##*$'\n'} out=${out%$'\n'*}
-  if [[ $code != 2?? ]]; then
-    err "Prism Central rejected the subnet update (HTTP ${code}): $(jq -r '[.message_list[]?.message] | join("; ")' <<<"$out" 2>/dev/null || head -c 300 <<<"$out")"
-    return 1
-  fi
-  task=$(jq -r '.status.execution_context.task_uuid // empty' <<<"$out" 2>/dev/null || true)
-  [[ -n $task ]] || return 0
-  for ((i = 0; i < 90; i++)); do
-    status=$(pc_api GET "/api/nutanix/v3/tasks/${task}" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
-    case $status in
-      SUCCEEDED)     return 0 ;;
-      FAILED|ABORTED) err "Subnet update task ${task} ${status}."; return 1 ;;
-    esac
-    sleep 2
-  done
-  err "Subnet update task ${task} did not finish within 3 minutes."
-  return 1
-}
-
-subnet_pools() { jq -r '[.spec.resources.ip_config.pool_list[]?.range | gsub(" +"; "-")] | join(",")' <<<"$1"; }
-
 lab_network() { # management run, between q_inventory and q_network
   step "Lab network: addresses for NKP and DNS"
-  local f subnet_json pools used_file plan="" responders="" try k v dns_ip="" dhcp_new=null body now
+  local f k rc=0 dhcp=keep now
   local IP_PLAN_COUNT IP_PLAN_BLOCK IP_PLAN_NEW_POOLS MGMT_CONTROLPLANE_IP WL_CONTROLPLANE_IP MGMT_LB_RANGE WL_LB_RANGE
+  local POOLS="" DNS_VM_IP="" DNS_OK=N
   local IP_PLAN_SUBNET=$SUBNET IP_PLAN_SUBNET_UUID=$SUBNET_UUID IP_PLAN_ORIGINAL_POOLS IP_PLAN_ORIGINAL_DHCP IP_PLAN_DNS="" IP_PLAN_DOMAIN=""
   f=$(ip_plan_file)
   if ((NO_IP_PLAN)); then info "--no-ip-plan: the subnet's IPAM pool and DHCP options stay as they are."; return 0; fi
@@ -1169,39 +951,28 @@ lab_network() { # management run, between q_inventory and q_network
     ok "Reusing ${f}: $(ip_plan_get IP_PLAN_BLOCK) is already outside the IPAM pool of ${SUBNET}"
     return 0
   fi
-  subnet_json=$(pc_api GET "/api/nutanix/v3/subnets/${SUBNET_UUID}" 2>/dev/null) \
-    || { warn "Could not read subnet ${SUBNET}; skipping the IP plan."; return 0; }
-  pools=$(subnet_pools "$subnet_json")
-  if [[ -z $pools ]]; then warn "${SUBNET} has no IPAM pool; nothing to reserve. Enter the addresses yourself."; return 0; fi
-  load_vms || warn "Could not list the VMs; only ping will detect used addresses."
-  used_file=$(mktemp)
-  used_ips "$subnet_json" >"$used_file"
-  for try in 1 2 3 4 5; do
-    plan=$(ip_select "$pools" "$used_file" "$IP_PLAN_MAX" "$IP_PLAN_MIN" "$IP_PLAN_NODE_RESERVE") || {
-      rm -f "$used_file"
-      die "The IPAM pool ${pools} of ${SUBNET} has no run of ${IP_PLAN_MIN} free addresses (keeping ${IP_PLAN_NODE_RESERVE} for nodes). Free some, or rerun with --no-ip-plan."
-    }
-    responders=$(range_responders "$(sed -n 's/^IP_PLAN_BLOCK=//p' <<<"$plan")")
-    [[ -n $responders ]] || break
-    warn "Attempt ${try}: addresses answering ping in the candidate block: ${responders//$'\n'/ }"
-    printf '%s\n' "$responders" >>"$used_file"
-  done
-  rm -f "$used_file"
-  [[ -z $responders ]] || die "Could not find a block of addresses that nobody answers on. Rerun with --no-ip-plan."
-  while IFS='=' read -r k v; do printf -v "$k" '%s' "$v"; done <<<"$plan"
+  info "Checking which addresses of ${SUBNET} are in use (VMs, hosts, ping)..."
+  py_vars pc ip-plan "$SUBNET_UUID" --pc-host "$PC_HOST" --max "$IP_PLAN_MAX" --min "$IP_PLAN_MIN" \
+    --reserve "$IP_PLAN_NODE_RESERVE" --dns-vm "$LAB_DNS_VM" --domain "$LAB_DOMAIN" || rc=$?
+  case $rc in
+    0) ;;
+    3) warn "${SUBNET} has no IPAM pool; nothing to reserve. Enter the addresses yourself."; return 0 ;;
+    4) die "The IPAM pool of ${SUBNET} has no run of ${IP_PLAN_MIN} free addresses (keeping ${IP_PLAN_NODE_RESERVE} for nodes). Free some, or rerun with --no-ip-plan." ;;
+    5) die "Could not find a block of addresses that nobody answers on. Rerun with --no-ip-plan." ;;
+    *) warn "Could not read subnet ${SUBNET}; skipping the IP plan."; return 0 ;;
+  esac
 
-  dns_ip=$(lab_dns_ip)
-  if [[ -z $dns_ip ]]; then
+  if [[ -z $DNS_VM_IP ]]; then
     warn "No VM named '${LAB_DNS_VM}' with an IPv4 address; the subnet's DNS settings stay unchanged."
-  elif ! dns_answers "$dns_ip" "$LAB_DOMAIN"; then
-    warn "${LAB_DNS_VM} (${dns_ip}) does not resolve ${LAB_DOMAIN}; the subnet's DNS settings stay unchanged."
+  elif [[ $DNS_OK != Y ]]; then
+    warn "${LAB_DNS_VM} (${DNS_VM_IP}) does not resolve ${LAB_DOMAIN}; the subnet's DNS settings stay unchanged."
   else
-    ok "${LAB_DNS_VM} (${dns_ip}) resolves ${LAB_DOMAIN}"
-    IP_PLAN_DNS=$dns_ip IP_PLAN_DOMAIN=$LAB_DOMAIN
-    dhcp_new=$(jq -nc --arg ip "$dns_ip" --arg d "$LAB_DOMAIN" '{domain_name_server_list: [$ip], domain_name: $d, domain_search_list: [$d]}')
+    ok "${LAB_DNS_VM} (${DNS_VM_IP}) resolves ${LAB_DOMAIN}"
+    IP_PLAN_DNS=$DNS_VM_IP IP_PLAN_DOMAIN=$LAB_DOMAIN
+    dhcp="merge:$(jq -nc --arg ip "$DNS_VM_IP" --arg d "$LAB_DOMAIN" '{domain_name_server_list: [$ip], domain_name: $d, domain_search_list: [$d]}')"
   fi
 
-  row "IPAM pool of ${SUBNET}" "$pools"
+  row "IPAM pool of ${SUBNET}" "$POOLS"
   row "Reserve for NKP" "${IP_PLAN_BLOCK} (${IP_PLAN_COUNT} addresses)"
   row "New IPAM pool" "${IP_PLAN_NEW_POOLS:-none}"
   row "Management cluster" "API ${MGMT_CONTROLPLANE_IP}, load balancer ${MGMT_LB_RANGE}"
@@ -1212,8 +983,6 @@ lab_network() { # management run, between q_inventory and q_network
     return 0
   fi
 
-  IP_PLAN_ORIGINAL_POOLS=$(jq -c '.spec.resources.ip_config.pool_list // []' <<<"$subnet_json")
-  IP_PLAN_ORIGINAL_DHCP=$(jq -c '.spec.resources.ip_config.dhcp_options // null' <<<"$subnet_json")
   (
     umask 077
     echo "# NKP IP plan written $(date -Is). ${SCRIPT_PATH} --destroy restores the original pool and DHCP options."
@@ -1223,16 +992,10 @@ lab_network() { # management run, between q_inventory and q_network
     done
   ) >"$f"
   chmod 600 "$f"
-  body=$(jq -c --argjson pools "$(ranges_to_pools "$IP_PLAN_NEW_POOLS")" --argjson dhcp "$dhcp_new" '
-      {api_version: (.api_version // "3.1"), metadata: .metadata,
-       spec: (.spec | .resources.ip_config.pool_list = $pools
-              | if $dhcp then .resources.ip_config.dhcp_options = ((.resources.ip_config.dhcp_options // {}) + $dhcp) else . end)}' \
-    <<<"$subnet_json")
-  if ! subnet_update "$body"; then
+  if ! now=$(py pc subnet-set "$SUBNET_UUID" --pools "$IP_PLAN_NEW_POOLS" --dhcp "$dhcp"); then
     rm -f "$f"
     die "The subnet was not changed. Rerun, or use --no-ip-plan and enter addresses yourself."
   fi
-  now=$(subnet_pools "$(pc_api GET "/api/nutanix/v3/subnets/${SUBNET_UUID}" 2>/dev/null || true)" 2>/dev/null || true)
   if [[ $now == "$IP_PLAN_NEW_POOLS" ]]; then ok "IPAM pool of ${SUBNET} is now ${now:-empty}; plan saved to ${f}"
   else warn "The IPAM pool reads back as '${now}', expected '${IP_PLAN_NEW_POOLS}'. Check the subnet in Prism Central."; fi
   NODE_POOLS=$IP_PLAN_NEW_POOLS
@@ -1343,20 +1106,17 @@ q_sizing() {
   fi
 }
 
-bundle_candidates() { # -> container-images directories of extracted air-gapped bundles for NKP_MINOR, newest first
+bundle_candidates() { # -> container-images directories of extracted NKP packages (nkp-bundle_* or nkp-air-gapped-bundle_*), newest first
   local d
-  if [[ -n $PACKAGE && $(basename "$PACKAGE") == nkp-air-gapped-bundle_* ]]; then
-    d="${HOME}/nkp-dist/$(basename "$PACKAGE" .tar.gz)"
-    find "$d" -maxdepth 3 -type d -name container-images 2>/dev/null || true
-  fi
-  find "${HOME}/nkp-dist" -maxdepth 3 -type d -path "*/nkp-air-gapped-bundle_v${NKP_MINOR}.*/container-images" 2>/dev/null \
-    | sort -r || true
+  for d in "${HOME}/nkp-dist" "$HOME"; do
+    find "$d" -maxdepth 3 -type d -path "*/nkp-v${NKP_MINOR}.*/container-images" 2>/dev/null || true
+  done | sort -rV | awk '!seen[$0]++'
 }
 
-bundle_files() { # container-images dir -> comma-separated tars for --bundle; exit 1 with the reason when incomplete
-  local dir=$1 f name out=() ver_re="-v?${NKP_MINOR//./\\.}\.[0-9]+"
-  for name in konvoy-image-bundle kommander-image-bundle nkp-release-specs nutanix-product-catalog; do
-    f=$(find "$dir" -maxdepth 1 -type f -name "${name}-*.tar" 2>/dev/null | sort | awk 'END {print}')
+bundle_files() { # container-images dir -> comma-separated tars for --bundle or nkp push bundle; exit 1 with the reason when incomplete
+  local dir=$1 f name out=() ver_re="-v?${NKP_MINOR//./\\.}(\.[0-9]+)?(-airgapped)?\.tar$"
+  for name in konvoy-image-bundle kommander-image-bundle nkp-release-specs; do
+    f=$(find "$dir" -maxdepth 1 -type f -name "${name}-*.tar" 2>/dev/null | sort -V | awk 'END {print}')
     if [[ -z $f ]]; then
       if [[ $name == k* ]]; then echo "      ${dir} has no ${name}-*.tar." >&2; return 1; fi
       continue
@@ -1366,10 +1126,10 @@ bundle_files() { # container-images dir -> comma-separated tars for --bundle; ex
     fi
     out+=("$f")
   done
-  if [[ ${USE_NDK_BUNDLE:-N} == Y ]]; then
-    f=$(find "$dir" -maxdepth 1 -type f -name 'ndk-*.tar' 2>/dev/null | sort | awk 'END {print}')
-    [[ -n $f ]] || { echo "      ${dir} has no ndk-*.tar; copy the NDK bundle there or answer No to NDK." >&2; return 1; }
-    out+=("$f")
+  if [[ ${USE_CATALOG_BUNDLES:-Y} == Y ]]; then
+    while IFS= read -r f; do
+      if [[ $(basename "$f") =~ $ver_re ]]; then out+=("$f"); else echo "      Skipping $(basename "$f"): not for NKP ${NKP_MINOR}." >&2; fi
+    done < <(find "$dir" -maxdepth 1 -type f -name '*catalog*.tar' 2>/dev/null | sort)
   fi
   local IFS=,
   printf '%s' "${out[*]}"
@@ -1381,13 +1141,13 @@ v_bundle_dir() {
 }
 
 q_bundle() { # management cluster: seed its internal registry (NCR) from the air-gapped bundle
-  BUNDLE_ARGS=() BUNDLE_COUNT=0
+  BUNDLE_ARGS=() BUNDLE_COUNT=0 BUNDLE_FILES=""
   if [[ -n $BUNDLE_DIR_ARG ]]; then BUNDLE_DIR=$BUNDLE_DIR_ARG USE_BUNDLE=Y; fi
   if [[ ${USE_BUNDLE:-} == N ]]; then info "Image bundle: not used (USE_BUNDLE=N); images come from the internet."; return 0; fi
   if [[ -z ${BUNDLE_DIR:-} || ! -d $BUNDLE_DIR ]]; then BUNDLE_DIR=$(bundle_candidates | awk 'NR == 1'); fi
   if [[ -z $BUNDLE_DIR && ${USE_BUNDLE:-} != Y ]]; then
-    info "No extracted air-gapped bundle under ${HOME}/nkp-dist: images come from the internet (Docker Hub)."
-    info "For a local registry, download nkp-air-gapped-bundle_v${NKP_MINOR}.x and rerun with --package (or --bundle-dir)."
+    info "No extracted nkp-v${NKP_MINOR}.x/container-images under ${HOME}/nkp-dist or ${HOME}: images come from the internet (Docker Hub)."
+    info "For a local registry, rerun with --package nkp-bundle_v${NKP_MINOR}.x_linux_amd64.tar.gz (or --bundle-dir DIR)."
     USE_BUNDLE=N
     return 0
   fi
@@ -1398,22 +1158,25 @@ q_bundle() { # management cluster: seed its internal registry (NCR) from the air
     USE_BUNDLE=N
     return 0
   fi
-  info "NKP pushes the bundle's images into ${CLUSTER_NAME}'s internal registry (Harbor, namespace ncr-system),"
-  info "and workload clusters can then pull from it instead of Docker Hub. Images outside the bundle still come from the internet."
-  if ! ask_yn "Seed the internal registry from the bundle?" "${USE_BUNDLE:-Y}"; then USE_BUNDLE=N; return 0; fi
+  info "${CLUSTER_NAME} is created with --bundle: NKP loads the images into its internal registry mirror. After that, the script"
+  info "deploys Harbor on ${CLUSTER_NAME}, pushes the same bundles into Harbor project ${HARBOR_PROJECT}, and workload clusters pull from there."
+  if ! ask_yn "Create ${CLUSTER_NAME} from the bundle?" "${USE_BUNDLE:-Y}"; then USE_BUNDLE=N; return 0; fi
   USE_BUNDLE=Y
-  if ask_yn "Also push the NDK catalog bundle (ndk-*.tar; only if you will deploy NDK)?" "${USE_NDK_BUNDLE:-N}"; then
-    USE_NDK_BUNDLE=Y
-  else
-    USE_NDK_BUNDLE=N
-  fi
   ask BUNDLE_DIR "Bundle directory (container-images)" v_bundle_dir
   BUNDLE_DIR=$(readlink -f "$BUNDLE_DIR")
-  local files f parts names=()
+  local files f parts names=() catalogs
+  catalogs=$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*catalog*.tar' -exec basename {} \; 2>/dev/null | sort | paste -sd' ' - || true)
+  if [[ -n $catalogs ]]; then
+    if ask_yn "Also seed the catalog application bundles (${catalogs})?" "${USE_CATALOG_BUNDLES:-Y}"; then
+      USE_CATALOG_BUNDLES=Y
+    else
+      USE_CATALOG_BUNDLES=N
+    fi
+  fi
   files=$(bundle_files "$BUNDLE_DIR")
   IFS=, read -r -a parts <<<"$files"
   for f in "${parts[@]}"; do names+=("$(basename "$f")"); done
-  BUNDLE_ARGS=(--bundle="$files") BUNDLE_COUNT=${#parts[@]}
+  BUNDLE_ARGS=(--bundle="$files") BUNDLE_COUNT=${#parts[@]} BUNDLE_FILES=$files
   ok "Bundle: ${names[*]}"
 }
 
@@ -1496,15 +1259,6 @@ ask_registry_login() { # USER_VAR SECRET_VAR "Label" "Secret prompt"
   die "${label} login failed three times. Check the token on the Nutanix Portal and rerun with --skip-prereqs."
 }
 
-pc_ntp_servers() { # from CLUSTERS_JSON: Prism Central's NTP list, else the node cluster's
-  jq -r --arg c "$NUTANIX_CLUSTER" '
-      def ntp: [.. | .ntp_server_ip_list? // empty | .[]?
-                | if type == "string" then . else (.ipv4.value? // .fqdn.value? // .value? // empty) end] | unique;
-      ([.entities[]? | select((.status.resources.config.service_list // []) | index("PRISM_CENTRAL")) | ntp] | add // []) as $pc
-      | ([.entities[]? | select(.status.name == $c) | ntp] | add // []) as $pe
-      | (if ($pc | length) > 0 then $pc else $pe end) | join(",")' <<<"$CLUSTERS_JSON" 2>/dev/null || true
-}
-
 q_extras() {
   step "Proxy, NTP and Prism Central onboarding"
   local env_proxy=${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}
@@ -1522,8 +1276,8 @@ q_extras() {
   else
     USE_PROXY=N
   fi
-  if [[ -z ${NTP_SERVERS:-} && -n ${CLUSTERS_JSON:-} ]]; then
-    NTP_SERVERS=$(pc_ntp_servers)
+  if [[ -z ${NTP_SERVERS:-} ]] && ((PC_API_OK)); then
+    NTP_SERVERS=$(py pc ntp "$NUTANIX_CLUSTER" 2>/dev/null || true)
     [[ -z $NTP_SERVERS ]] || info "Prism Central uses NTP ${NTP_SERVERS}"
   fi
   ask NTP_SERVERS "NTP servers, comma-separated (blank = keep the image defaults)" optional
@@ -1544,47 +1298,29 @@ sizing_need() { # -> "nodes vcpus memory_gib" for the current SIZING values
 
 capacity_check() { # nodes vcpus memory_gib: everything this run will create on NUTANIX_CLUSTER
   step "Capacity of ${NUTANIX_CLUSTER}"
-  local nodes=$1 vcpus=$2 mem=$3 disk=$(($1 * NODE_DISK_GIB)) line nhosts="" cores=0 hmem=0 vm_cpu=0 vm_mem=0 cvm free usable sc cap
-  local registry=""
-  if ((${#BUNDLE_ARGS[@]})); then disk=$((disk + HARBOR_DISK_GIB)) registry=" (incl. ${HARBOR_DISK_GIB} GiB for the internal registry)"; fi
+  local nodes=$1 vcpus=$2 mem=$3 disk=$(($1 * NODE_DISK_GIB)) cvm free usable registry=""
+  local HOSTS="" CORES=0 HOST_MEM_GIB=0 VM_VCPU=0 VM_MEM_GIB=0 SC_FREE_GIB="" VMS_OK=N
+  if ((${#BUNDLE_ARGS[@]})); then disk=$((disk + HARBOR_DISK_GIB)) registry=" (incl. ${HARBOR_DISK_GIB} GiB of Rook Ceph volumes for Harbor)"; fi
   if ((!PC_API_OK)) || [[ -z ${PE_UUID:-} ]]; then warn "Prism Central API not available; skipping the capacity check."; return 0; fi
-  line=$(pc_api GET "/api/clustermgmt/v4.0/config/clusters/${PE_UUID}/hosts" 2>/dev/null \
-    | jq -r '[.data[]?] | "\(length) \(map(.numberOfCpuCores // 0) | add // 0) \(map(.memorySizeBytes // 0) | add // 0 | ./1073741824 | floor)"' \
-    2>/dev/null || true)
-  read -r nhosts cores hmem <<<"$line"
-  if [[ -z $nhosts ]] || ((nhosts == 0 || hmem == 0)); then
+  py_vars pc capacity "$PE_UUID" "$STORAGE_CONTAINER_NAME" 2>/dev/null || true
+  if [[ -z $HOSTS ]] || ((HOSTS == 0 || HOST_MEM_GIB == 0)); then
     warn "Could not read the hosts of ${NUTANIX_CLUSTER}; skipping the capacity check."
     return 0
   fi
-  if load_vms; then
-    line=$(jq -r --arg u "$PE_UUID" '
-        [.[] | select(.status.cluster_reference.uuid == $u and .status.resources.power_state == "ON") | .status.resources]
-        | "\(map((.num_sockets // 1) * (.num_vcpus_per_socket // 1)) | add // 0) \(map(.memory_size_mib // 0) | add // 0 | ./1024 | floor)"' \
-      "$VMS_FILE" 2>/dev/null || true)
-    read -r vm_cpu vm_mem <<<"$line"
-  else
-    warn "Could not list the VMs; assuming the cluster is empty."
-  fi
-  cvm=$((nhosts * CVM_RESERVE_GIB))
-  free=$((hmem - ${vm_mem:-0} - cvm))
+  [[ $VMS_OK == Y ]] || warn "Could not list the VMs; assuming the cluster is empty."
+  cvm=$((HOSTS * CVM_RESERVE_GIB))
+  free=$((HOST_MEM_GIB - VM_MEM_GIB - cvm))
   usable=$((free * 90 / 100))
-  row "Hosts" "${nhosts}: ${cores} cores, ${hmem} GiB memory"
-  row "Running VMs" "${vm_cpu:-0} vCPU, ${vm_mem:-0} GiB (CVMs about ${cvm} GiB)"
+  row "Hosts" "${HOSTS}: ${CORES} cores, ${HOST_MEM_GIB} GiB memory"
+  row "Running VMs" "${VM_VCPU} vCPU, ${VM_MEM_GIB} GiB (CVMs about ${cvm} GiB)"
   row "NKP adds" "${nodes} VMs: ${vcpus} vCPU, ${mem} GiB memory, ${disk} GiB disk${registry}"
-  if ((cores > 0 && ${vm_cpu:-0} + vcpus > cores * 4)); then
-    warn "vCPU overcommit would be $(((${vm_cpu:-0} + vcpus) / cores)):1, above 4:1. Expect slow platform applications."
+  if ((CORES > 0 && VM_VCPU + vcpus > CORES * 4)); then
+    warn "vCPU overcommit would be $(((VM_VCPU + vcpus) / CORES)):1, above 4:1. Expect slow platform applications."
   fi
-  # shellcheck disable=SC2016
-  sc=$(pc_api GET '/api/clustermgmt/v4.0/config/storage-containers?$limit=100' 2>/dev/null \
-    | jq -c --arg n "$STORAGE_CONTAINER_NAME" --arg u "$PE_UUID" \
-        '[.data[]? | select(.name == $n and ((.clusterExtId // $u) == $u))][0] // empty' 2>/dev/null || true)
-  if [[ -n $sc ]]; then
-    cap=$(storage_free_gib "$sc")
-    if [[ -n $cap ]] && ((disk > cap)); then
-      warn "Storage container ${STORAGE_CONTAINER_NAME} has about ${cap} GiB free; NKP takes up to ${disk} GiB${registry} (thin provisioned)."
-    elif [[ -n $cap ]]; then
-      ok "Storage: ${disk} GiB${registry}, about ${cap} GiB free in ${STORAGE_CONTAINER_NAME}"
-    fi
+  if [[ -n $SC_FREE_GIB ]] && ((disk > SC_FREE_GIB)); then
+    warn "Storage container ${STORAGE_CONTAINER_NAME} has about ${SC_FREE_GIB} GiB free; NKP takes up to ${disk} GiB${registry} (thin provisioned)."
+  elif [[ -n $SC_FREE_GIB ]]; then
+    ok "Storage: ${disk} GiB${registry}, about ${SC_FREE_GIB} GiB free in ${STORAGE_CONTAINER_NAME}"
   fi
   if ((mem > usable)); then
     warn "Not enough memory: NKP needs ${mem} GiB, about ${usable} GiB is free after the CVMs and a 10% margin."
@@ -1592,16 +1328,6 @@ capacity_check() { # nodes vcpus memory_gib: everything this run will create on 
   else
     ok "Memory: ${mem} GiB needed, about ${usable} GiB free"
   fi
-}
-
-storage_free_gib() { # storage container JSON (v4) -> free GiB, from its stats when available, else its capacity
-  local id stats used max
-  id=$(jq -r '.containerExtId // .extId // empty' <<<"$1")
-  max=$(jq -r '.maxCapacityBytes // empty' <<<"$1")
-  [[ -n $id && -n $max ]] || return 0
-  stats=$(pc_api GET "/api/clustermgmt/v4.0/stats/storage-containers/${id}?\$startTime=$(date -u -d '-1 hour' +%FT%TZ)&\$endTime=$(date -u +%FT%TZ)&\$statType=LAST&\$samplingInterval=3600" 2>/dev/null || true)
-  used=$(jq -r '[.data.storageUsageBytes[]?.value] | last // empty' <<<"$stats" 2>/dev/null || true)
-  jq -nr --argjson m "$max" --argjson u "${used:-0}" '($m - $u) / 1073741824 | floor'
 }
 
 build_command() {
@@ -1688,9 +1414,10 @@ show_summary() {
   row "Sizing" "$SIZING"
   row "SSH" "$SSH_USERNAME, key $SSH_PUBLIC_KEY"
   if ((${#BUNDLE_ARGS[@]})); then
-    row "Images" "bundle (${BUNDLE_COUNT} files from ${BUNDLE_DIR}) -> internal registry"
+    row "Images" "bundle (${BUNDLE_COUNT} files from ${BUNDLE_DIR}) -> internal registry mirror"
+    row "Then" "${REGISTRY_MIRROR_URL:-Harbor on ${CLUSTER_NAME}}: push the bundle for workload clusters"
   elif ((${#REGISTRY_MIRROR_ARGS[@]})); then
-    row "Images" "${MGMT_CLUSTER_NAME} internal registry ${NCR_URL} (${NCR_AUTH})"
+    row "Images" "Harbor ${NCR_URL} (${NCR_AUTH})"
   else
     row "Images" "internet (Docker Hub)"
   fi
@@ -1790,8 +1517,12 @@ phase_status() {
   kubectl --kubeconfig "$kcfg" get nkpclusters -A >&2 2>/dev/null || true
   nkp get dashboard --kubeconfig="$kcfg" 2>/dev/null || true
   local url
-  if url=$(ncr_url "$kcfg"); then
-    info "Internal registry: ${url} (user admin; password: $(ncr_password_cmd "$kcfg"))"
+  url=$(harbor_marker_get "$CLUSTER_NAME" HARBOR_URL)
+  if [[ -n $url ]]; then
+    info "Harbor for workload clusters: ${url} (bundles pushed $(harbor_marker_get "$CLUSTER_NAME" PUSH_DATE))"
+    if [[ $(harbor_marker_get "$CLUSTER_NAME" HARBOR_EXTERNAL) != Y ]]; then info "  admin password: $(harbor_password_cmd "$kcfg")"; fi
+  elif [[ ${USE_BUNDLE:-N} == Y ]]; then
+    info "No bundle pushed to Harbor yet; workload clusters pull from the internet. Push it: ${SCRIPT_PATH} --harbor"
   fi
   if write_lab_summary; then info "Lab summary: ${WORKDIR}/lab-summary.txt"; fi
 }
@@ -1819,12 +1550,17 @@ write_lab_summary() { # -> ${WORKDIR}/lab-summary.txt, mode 600 (it holds the da
     if [[ -f $mk ]]; then
       printf '  Dashboard\n'
       nkp get dashboard --kubeconfig="$mk" 2>/dev/null | sed 's/^/    /' || echo "    (not available yet: nkp get dashboard --kubeconfig=${mk})"
-      if url=$(ncr_url "$mk"); then
-        seeded=""
-        if [[ ${USE_BUNDLE:-} == Y ]]; then seeded=", seeded from the bundle"; fi
-        printf '  %-20s %s\n' "Internal registry" "${url} (user admin${seeded})"
-        printf '    password: %s\n' "$(ncr_password_cmd "$mk")"
+    fi
+    url=$(harbor_marker_get "$m" HARBOR_URL)
+    if [[ -n $url ]]; then
+      printf '  %-20s %s\n' "Harbor" "${url} (bundles pushed $(harbor_marker_get "$m" PUSH_DATE))"
+      if [[ $(harbor_marker_get "$m" HARBOR_EXTERNAL) == Y ]]; then
+        printf '    user: %s (REGISTRY_MIRROR_URL)\n' "$(harbor_marker_get "$m" HARBOR_USER)"
+      else
+        printf '    user admin, password: %s\n' "$(harbor_password_cmd "$mk")"
       fi
+    elif [[ ${USE_BUNDLE:-} == Y ]]; then
+      printf '  %-20s %s\n' "Harbor" "bundle not pushed yet: ${SCRIPT_PATH} --harbor"
     fi
     if [[ -f ${WORKDIR}/nkp-workload.env ]]; then
       # shellcheck disable=SC1090,SC1091
@@ -1833,7 +1569,7 @@ write_lab_summary() { # -> ${WORKDIR}/lab-summary.txt, mode 600 (it holds the da
       printf '  %-20s %s\n' "API endpoint" "https://${CONTROLPLANE_IP}:6443" "Load balancer range" "$SERVICE_LB_IP_RANGE" \
         "Kubeconfig" "${WORKDIR}/${CLUSTER_NAME}/${CLUSTER_NAME}.conf"
       if [[ ${USE_MGMT_REGISTRY:-} == Y ]]; then
-        printf '  %-20s %s\n' "Images" "from ${m}'s internal registry${url:+ (${url})}"
+        printf '  %-20s %s\n' "Images" "from Harbor${url:+ ${url}}"
       fi
       if [[ -f $mk ]]; then
         printf '  %-20s %s\n' "State" "$(kubectl --kubeconfig "$mk" -n "$WORKSPACE_NAMESPACE" get nkpclusters "$CLUSTER_NAME" --no-headers 2>/dev/null || echo unknown)"
@@ -1849,6 +1585,7 @@ Commands
 
   Status:                ${SCRIPT_PATH} --status
   Another workload:      ${SCRIPT_PATH} --workload
+  Push the bundle:       ${SCRIPT_PATH} --harbor
   Delete the whole lab:  ${SCRIPT_PATH} --destroy
 EOF
   ) >"$f.tmp" 2>/dev/null || true
@@ -1857,11 +1594,8 @@ EOF
   chmod 600 "$f"
 }
 
-helmreleases_not_ready() { # kubeconfig namespace -> prints HelmReleases that are not Ready; exit 1 if none exist yet
-  local out
-  out=$(kubectl --kubeconfig "$1" -n "$2" get helmreleases --no-headers 2>/dev/null || true)
-  [[ -n $out ]] || return 1
-  awk '$3 != "True"' <<<"$out"
+helmreleases_not_ready() { # kubeconfig namespace -> "name<TAB>message" of HelmReleases not Ready; exit 1 if none exist yet
+  py k8s hr-not-ready "$2" --kubeconfig "$1" 2>/dev/null
 }
 
 wait_helmreleases() { # kubeconfig namespace minutes -> 0 once every HelmRelease is Ready
@@ -1874,17 +1608,12 @@ wait_helmreleases() { # kubeconfig namespace minutes -> 0 once every HelmRelease
 }
 
 remediate_apps() { # kubeconfig cluster hr_namespace management_kubeconfig: add workers for unschedulable pods, retry failed apps
-  local kcfg=$1 cluster=$2 hr_ns=$3 mgmt=$4 attempt starved md md_ns md_name replicas ts failed hr
+  local kcfg=$1 cluster=$2 hr_ns=$3 mgmt=$4 attempt starved md md_ns md_name replicas failed
   for attempt in 1 2; do
-    starved=$(kubectl --kubeconfig "$kcfg" get pods -A --field-selector=status.phase=Pending -o json 2>/dev/null \
-      | jq -r '.items[] | select(any(.status.conditions[]?; .type == "PodScheduled" and .status == "False"
-                 and ((.message // "") | test("Insufficient (cpu|memory)")))) | "\(.metadata.namespace)/\(.metadata.name)"' \
-      2>/dev/null || true)
+    starved=$(py k8s starved-pods --kubeconfig "$kcfg" 2>/dev/null || true)
     if [[ -n $starved ]]; then
       warn "Pods that cannot be scheduled for lack of CPU or memory: ${starved//$'\n'/ }"
-      md=$(kubectl --kubeconfig "$mgmt" get machinedeployments -A -l "cluster.x-k8s.io/cluster-name=${cluster}" -o json 2>/dev/null \
-        | jq -r '[.items[] | select((.metadata.labels["topology.cluster.x-k8s.io/deployment-name"] // .metadata.name) | test("md-0"))][0]
-                 // empty | "\(.metadata.namespace) \(.metadata.name) \(.spec.replicas)"' 2>/dev/null || true)
+      md=$(py k8s md0 "$cluster" --kubeconfig "$mgmt" 2>/dev/null || true)
       read -r md_ns md_name replicas <<<"$md"
       if [[ ! ${replicas:-} =~ ^[0-9]+$ ]]; then warn "Could not find node pool md-0 of ${cluster}; scale it yourself."; break; fi
       ask_yn "Add a worker to ${cluster} (md-0: ${replicas} -> $((replicas + 1)), attempt ${attempt} of 2)?" Y || break
@@ -1895,12 +1624,9 @@ remediate_apps() { # kubeconfig cluster hr_namespace management_kubeconfig: add 
       kubectl --kubeconfig "$mgmt" -n "$md_ns" wait --for=jsonpath='{.status.readyReplicas}'="$((replicas + 1))" \
         "machinedeployments.cluster.x-k8s.io/${md_name}" --timeout=20m >&2 || warn "The new worker is not ready yet."
     fi
-    failed=$(helmreleases_not_ready "$kcfg" "$hr_ns" | awk '{print $1}' || true)
-    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    for hr in $failed; do
-      kubectl --kubeconfig "$kcfg" -n "$hr_ns" annotate --overwrite "helmreleases.helm.toolkit.fluxcd.io/${hr}" \
-        "reconcile.fluxcd.io/requestedAt=${ts}" "reconcile.fluxcd.io/resetAt=${ts}" "reconcile.fluxcd.io/forceAt=${ts}" >/dev/null 2>&1 || true
-    done
+    failed=$(helmreleases_not_ready "$kcfg" "$hr_ns" | cut -f1 || true)
+    # shellcheck disable=SC2086  # one argument per HelmRelease name
+    if [[ -n $failed ]]; then py k8s hr-reconcile "$hr_ns" $failed --kubeconfig "$kcfg" >/dev/null 2>&1 || true; fi
     info "Retrying ${failed//$'\n'/ }; waiting up to 20 more minutes..."
     if wait_helmreleases "$kcfg" "$hr_ns" 20; then ok "All platform applications are ready"; return 0; fi
     [[ -n $starved ]] || break
@@ -1938,6 +1664,9 @@ post_install() {
       Node pool commands on this cluster need: -n kommander
       Workload clusters: ${SCRIPT_PATH} --workload
 EOF
+  if [[ ${USE_BUNDLE:-N} == Y || -n ${REGISTRY_MIRROR_URL:-} ]]; then
+    harbor_step "$CLUSTER_NAME" "$kcfg" || warn "Workload clusters pull from the internet until the images are pushed: ${SCRIPT_PATH} --harbor"
+  fi
   if ((!LAB)) && ask_yn "Create a workload cluster on ${CLUSTER_NAME} now?" N; then
     local args=(--workload --workdir "$WORKDIR")
     if ((FORCE_INSECURE)); then args+=(--insecure); fi
@@ -1951,7 +1680,7 @@ phase_setup() {
   ensure_docker_access
   ensure_tmux_session
   PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NUTANIX_REGISTRY_ARGS=() NODE_CIDR="" NODE_POOLS=""
-  BUNDLE_ARGS=() REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
+  BUNDLE_ARGS=() BUNDLE_FILES="" REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
   load_answers
   q_cluster
   q_prism_central
@@ -2008,7 +1737,7 @@ phase_lab() {
   ensure_docker_access
   ensure_tmux_session
   PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NUTANIX_REGISTRY_ARGS=() NODE_CIDR="" NODE_POOLS=""
-  BUNDLE_ARGS=() REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
+  BUNDLE_ARGS=() BUNDLE_FILES="" REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
   load_answers
   q_cluster
   q_prism_central
@@ -2019,6 +1748,9 @@ phase_lab() {
   q_bundle
   q_access
   q_extras
+  if [[ -n ${REGISTRY_MIRROR_URL:-} ]]; then
+    ask_secret REGISTRY_MIRROR_PASSWORD "Password of ${REGISTRY_MIRROR_USERNAME:-admin} on ${REGISTRY_MIRROR_URL}"
+  fi
   save_answers
   ok "Answers saved to ${ANSWERS_FILE} (no passwords)"
   build_command
@@ -2034,7 +1766,7 @@ phase_lab() {
   row "Control plane endpoint" "$WL_CONTROLPLANE_IP"
   row "Load balancer range" "$WL_LB_RANGE"
   row "Sizing" "$WL_SIZING"
-  ask_yn "Create ${CLUSTER_NAME} and then ${WL_CLUSTER_NAME} now, without further questions (about 90 minutes)?" Y \
+  ask_yn "Create ${CLUSTER_NAME}${BUNDLE_FILES:+, set up Harbor} and then ${WL_CLUSTER_NAME} now, without further questions (about 2 hours)?" Y \
     || { info "Answers saved; rerun with: ${SCRIPT_PATH} --lab --skip-prereqs"; exit 0; }
   UNATTENDED=1
   export NUTANIX_USER NUTANIX_PASSWORD
@@ -2046,6 +1778,7 @@ phase_lab() {
   args=(--workload --unattended --skip-prereqs --workdir "$WORKDIR")
   if ((FORCE_INSECURE)); then args+=(--insecure); fi
   if [[ -n ${DOCKERHUB_PASSWORD:-} ]]; then export DOCKERHUB_PASSWORD; fi
+  if [[ -n ${REGISTRY_MIRROR_PASSWORD:-} ]]; then export REGISTRY_MIRROR_PASSWORD; fi
   NKP_LAB_CHILD=1 bash "$SCRIPT_PATH" "${args[@]}" || rc=$?
   ((rc == 0)) || warn "The workload cluster run ended with exit ${rc}. Rerun it with: ${SCRIPT_PATH} --workload"
   write_lab_summary || true
@@ -2058,7 +1791,7 @@ phase_lab() {
 # ---------------------------------------------------------------------------
 
 load_mgmt_context() {
-  local f="${WORKDIR}/nkp-install.env" json kv
+  local f="${WORKDIR}/nkp-install.env" kv
   [[ -f $f ]] || die "No management cluster answers at ${f}. Create the management cluster first, or pass --workdir."
   # shellcheck disable=SC1090
   . "$f"
@@ -2066,121 +1799,218 @@ load_mgmt_context() {
   MGMT_KCFG="${WORKDIR}/${MGMT_CLUSTER_NAME}/${MGMT_CLUSTER_NAME}.conf"
   [[ -f $MGMT_KCFG ]] || die "No kubeconfig for ${MGMT_CLUSTER_NAME} at ${MGMT_KCFG}."
   MGMT_K=(kubectl --kubeconfig "$MGMT_KCFG")
-  json=$("${MGMT_K[@]}" get clusters.cluster.x-k8s.io -A -o json 2>/dev/null) \
+  RESERVED_RANGES=$(py k8s reserved-ranges --kubeconfig "$MGMT_KCFG" 2>/dev/null) \
     || die "Cannot list Cluster API clusters on ${MGMT_CLUSTER_NAME} with ${MGMT_KCFG}. Is it up? Try: ${SCRIPT_PATH} --status"
   ok "Management cluster ${MGMT_CLUSTER_NAME} is reachable"
-  kv=$("${MGMT_K[@]}" get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null || true)
+  kv=$(py k8s kubelet-version --kubeconfig "$MGMT_KCFG" 2>/dev/null || true)
   if [[ $kv =~ ^v?([0-9]+\.[0-9]+) ]]; then
     K8S_VERSION_HINT=${BASH_REMATCH[1]}
     info "${MGMT_CLUSTER_NAME} runs Kubernetes ${kv}; the workload node image should be built for ${K8S_VERSION_HINT}."
   fi
-  RESERVED_RANGES=$(jq -r '
-      [ .items[]?
-        | (.spec.controlPlaneEndpoint.host // empty | select(test("^[0-9.]+$")) | "\(.)-\(.)"),
-          (.. | objects | select(has("addressRanges")) | .addressRanges[]? | select(.start and .end) | "\(.start)-\(.end)") ]
-      | unique | join(",")' <<<"$json" 2>/dev/null || true)
   if [[ -n ${CONTROLPLANE_IP:-} ]]; then RESERVED_RANGES+="${RESERVED_RANGES:+,}${CONTROLPLANE_IP}-${CONTROLPLANE_IP}"; fi
   if [[ -n ${SERVICE_LB_IP_RANGE:-} ]]; then RESERVED_RANGES+="${RESERVED_RANGES:+,}${SERVICE_LB_IP_RANGE}"; fi
   RESERVED_RANGES=$(tr ',' '\n' <<<"$RESERVED_RANGES" | awk 'NF && !seen[$0]++' | paste -sd, - || true)
   [[ -z $RESERVED_RANGES ]] || info "Addresses already used by NKP clusters: ${RESERVED_RANGES}"
 }
 
-ncr_url() { # management kubeconfig -> https://<ingress address>:5000 when the internal registry (ncr-system) exists
-  local k=(kubectl --kubeconfig "$1") host
-  "${k[@]}" -n ncr-system get secret harbor-admin-password >/dev/null 2>&1 || return 1
-  host=$("${k[@]}" -n kommander get kommanderclusters -l kommander.d2iq.io/host=true \
-    -o jsonpath='{.items[0].status.ingress.address}' 2>/dev/null || true)
-  [[ -n $host ]] || return 1
-  printf 'https://%s:%s' "$host" "$NCR_PORT"
+# ---------------------------------------------------------------------------
+# Harbor: the registry workload clusters pull from
+# ---------------------------------------------------------------------------
+
+harbor_marker() { printf '%s' "${WORKDIR}/$1/harbor-push.env"; } # management cluster -> its push record (no secrets)
+
+harbor_marker_get() { # management cluster, KEY -> its value in the push record
+  local f; f=$(harbor_marker "$1")
+  [[ -f $f ]] || return 0
+  # shellcheck disable=SC1090
+  (. "$f"; printf '%s' "${!2:-}")
 }
 
-ncr_password_cmd() { # management kubeconfig -> the command that prints the Harbor admin password
+hpy() { # nkp_lab.py harbor ... against HARBOR_URL as HARBOR_USER (password through the environment)
+  NKP_HARBOR_URL="$HARBOR_URL" NKP_HARBOR_CA="${HARBOR_CACERT:-}" NKP_HARBOR_USER="${HARBOR_USER:-admin}" \
+    NKP_HARBOR_PASSWORD="${HARBOR_PASSWORD:-}" py harbor "$@"
+}
+
+harbor_project() { # https://host[:port]/project[/...] -> project
+  local p=${1#*://}
+  [[ $p == */* ]] || return 0
+  p=${p#*/}
+  printf '%s' "${p%%/*}"
+}
+
+harbor_password_cmd() { # management kubeconfig -> the command that prints the Harbor admin password
   printf "kubectl --kubeconfig %s -n ncr-system get secret harbor-admin-password -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d" "$1"
 }
 
-harbor_api() { # METHOD PATH [JSON]: Harbor API of the internal registry as admin
-  local extra=()
-  if [[ -n ${3-} ]]; then extra=(-H 'Content-Type: application/json' --data "$3"); fi
-  printf 'user = "admin:%s"\n' "$(cfg_escape "$NCR_ADMIN_PASSWORD")" \
-    | curl -K - -sS --fail --max-time 30 --cacert "$NCR_CACERT" -H 'Accept: application/json' \
-        -X "$1" "${extra[@]}" "${NCR_URL}/api/v2.0$2"
-}
-
-ncr_robot() { # name -> "user secret" of a new pull-only robot account on every project; replaces one with that name
-  local name=$1 id body out
-  while read -r id; do
-    [[ -z $id ]] || harbor_api DELETE "/robots/${id}" >/dev/null || true
-  done < <(harbor_api GET '/robots?page_size=100' 2>/dev/null \
-    | jq -r --arg n "$name" '.[]? | select(.name == $n or (.name | endswith("$" + $n))) | .id' 2>/dev/null || true)
-  body=$(jq -nc --arg n "$name" --arg d "Pull-only access for NKP workload cluster ${CLUSTER_NAME}" \
-    '{name: $n, description: $d, level: "system", duration: -1, disable: false,
-      permissions: [{kind: "project", namespace: "*", access: [{resource: "repository", action: "pull"}]}]}')
-  out=$(harbor_api POST /robots "$body" 2>/dev/null) || return 1
-  jq -er '"\(.name) \(.secret)"' <<<"$out" 2>/dev/null
-}
-
-q_mgmt_registry() { # workload cluster: pull images through the management cluster's internal registry
-  REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
-  local def=${USE_MGMT_REGISTRY:-$MGMT_USE_BUNDLE} ca projects robot user="" pass=""
-  [[ $def == Y ]] || def=N
-  if ! NCR_URL=$(ncr_url "$MGMT_KCFG"); then
-    NCR_URL=""
-    info "Images: ${MGMT_CLUSTER_NAME} has no internal registry (ncr-system); ${CLUSTER_NAME} pulls from the internet."
-    USE_MGMT_REGISTRY=N
+harbor_login() { # management cluster, kubeconfig -> HARBOR_URL HARBOR_CACERT HARBOR_USER HARBOR_PASSWORD HARBOR_EXTERNAL
+  if [[ -n ${REGISTRY_MIRROR_URL:-} ]]; then
+    HARBOR_EXTERNAL=Y HARBOR_URL=${REGISTRY_MIRROR_URL%/} HARBOR_CACERT=${REGISTRY_MIRROR_CACERT:-}
+    HARBOR_USER=${REGISTRY_MIRROR_USERNAME:-admin}
+    ask_secret REGISTRY_MIRROR_PASSWORD "Password of ${HARBOR_USER} on ${HARBOR_URL}"
+    HARBOR_PASSWORD=$REGISTRY_MIRROR_PASSWORD
     return 0
   fi
+  HARBOR_EXTERNAL=N HARBOR_USER=admin
+  HARBOR_URL=$(harbor_marker_get "$1" HARBOR_URL) HARBOR_CACERT=$(harbor_marker_get "$1" HARBOR_CACERT)
+  HARBOR_PASSWORD=$(py k8s harbor-password --kubeconfig "$2" 2>/dev/null) \
+    || die "Cannot read the Harbor admin password from $1 (ncr-system/harbor-admin-password)."
+}
+
+harbor_step() { # management cluster, kubeconfig: Harbor on it (or REGISTRY_MIRROR_URL), the bundle pushed into project nkp
+  local mgmt=$1 kcfg=$2 marker files dir parts f push=() shown=() proj uid repos k
+  local NCR_HOST="" NCR_PRESENT=N NCR_CA_FOUND=N PUSH_UID PUSH_BUNDLES PUSH_DATE
+  marker=$(harbor_marker "$mgmt")
+  step "Harbor: the registry for workload clusters"
+  files=${BUNDLE_FILES:-}
+  if [[ -z $files ]]; then
+    dir=${BUNDLE_DIR_ARG:-${BUNDLE_DIR:-}}
+    [[ -n $dir && -d $dir ]] || dir=$(bundle_candidates | awk 'NR == 1')
+    if [[ -z $dir ]]; then
+      warn "No extracted nkp-v${NKP_MINOR}.x/container-images under ${HOME}/nkp-dist or ${HOME}; nothing to push. Use --bundle-dir DIR."
+      return 1
+    fi
+    files=$(bundle_files "$dir") || return 1
+  fi
+
+  if [[ -n ${REGISTRY_MIRROR_URL:-} ]]; then
+    harbor_login "$mgmt" "$kcfg"
+    info "Registry: REGISTRY_MIRROR_URL ${HARBOR_URL}; no Harbor is deployed on ${mgmt}."
+  else
+    HARBOR_CACERT="${WORKDIR}/${mgmt}/harbor-ca.pem"
+    py_vars k8s ncr --kubeconfig "$kcfg" --ca-out "$HARBOR_CACERT" \
+      || die "Cannot read the ingress of ${mgmt} (kommandercluster). Try: ${SCRIPT_PATH} --status"
+    [[ -n $NCR_HOST ]] || die "${mgmt} has no ingress address yet. Try: ${SCRIPT_PATH} --status"
+    if [[ $NCR_PRESENT == Y ]]; then
+      ok "Harbor is already running on ${mgmt} (namespace ncr-system)"
+    else
+      info "Enables CloudNativePG, raises Rook Ceph to ${CEPH_OSD_COUNT} volumes of 40 GiB, creates an object bucket and enables"
+      info "Harbor (namespace ncr-system), as in the NKP ${NKP_MINOR} guide 'Deploying Harbor on a Management Cluster'."
+      if [[ -n $HARBOR_OVERRIDES_FILE ]]; then info "Harbor values: ${HARBOR_OVERRIDES_FILE}"; fi
+      ask_yn "Deploy Harbor on ${mgmt} now (about 15 minutes)?" Y || { info "Skipped. Later: ${SCRIPT_PATH} --harbor"; return 1; }
+      py k8s harbor-deploy --kubeconfig "$kcfg" --ceph-count "$CEPH_OSD_COUNT" \
+        ${HARBOR_OVERRIDES_FILE:+--overrides-file "$HARBOR_OVERRIDES_FILE"} >/dev/null \
+        || die "Harbor did not come up. Check: kubectl --kubeconfig ${kcfg} -n ncr-system get helmreleases,pods"
+      py_vars k8s ncr --kubeconfig "$kcfg" --ca-out "$HARBOR_CACERT" || true
+      ok "Harbor is running on ${mgmt}"
+    fi
+    [[ $NCR_CA_FOUND == Y ]] || die "Cannot read the ingress CA of ${mgmt} (kommandercluster status.ingress.caBundle)."
+    HARBOR_URL="https://${NCR_HOST}:${NCR_PORT}/${HARBOR_PROJECT}" HARBOR_EXTERNAL=N HARBOR_USER=admin
+    HARBOR_PASSWORD=$(py k8s harbor-password --kubeconfig "$kcfg") \
+      || die "Cannot read the Harbor admin password from ${mgmt} (ncr-system/harbor-admin-password)."
+  fi
+  hpy ping || die "Harbor at ${HARBOR_URL} does not answer from this host${HARBOR_CACERT:+ with the CA ${HARBOR_CACERT}}."
+  ok "Harbor answers at ${HARBOR_URL}"
+  proj=$(harbor_project "$HARBOR_URL")
+  [[ -n $proj ]] || die "The registry URL ${HARBOR_URL} has no Harbor project; use https://<host>/<project>, e.g. .../${HARBOR_PROJECT}."
+  hpy ensure-project "$proj" || die "Cannot create the Harbor project ${proj}."
+
+  PUSH_UID=$(py k8s uid --kubeconfig "$kcfg" 2>/dev/null || echo unknown) PUSH_BUNDLES=$files PUSH_DATE=$(date -Is)
+  if [[ $(harbor_marker_get "$mgmt" PUSH_UID) == "$PUSH_UID" && $(harbor_marker_get "$mgmt" HARBOR_URL) == "$HARBOR_URL" \
+        && $(harbor_marker_get "$mgmt" PUSH_BUNDLES) == "$files" ]]; then
+    ok "These bundles were pushed to ${HARBOR_URL} on $(harbor_marker_get "$mgmt" PUSH_DATE); not pushing again."
+    return 0
+  fi
+  IFS=, read -r -a parts <<<"$files"
+  repos=$(hpy repos "$proj" 2>/dev/null || echo 0)
+  if [[ $repos =~ ^[0-9]+$ ]] && ((repos > 0)) \
+     && ! ask_yn "Project ${proj} already holds ${repos} repositories. Push the ${#parts[@]} bundles anyway?" N; then
+    info "Not pushing; workload clusters use what is already in ${HARBOR_URL}."
+    PUSH_BUNDLES="existing (${repos} repositories)"
+  else
+    push=(nkp push bundle)
+    for f in "${parts[@]}"; do push+=(--bundle "$f"); done
+    push+=(--to-registry="$HARBOR_URL" --to-registry-username="$HARBOR_USER")
+    shown=("${push[@]}" --to-registry-password=********)
+    push+=(--to-registry-password="$HARBOR_PASSWORD")
+    if [[ -n $HARBOR_CACERT ]]; then push+=(--to-registry-ca-cert-file="$HARBOR_CACERT") shown+=(--to-registry-ca-cert-file="$HARBOR_CACERT"); fi
+    info "Pushing ${#parts[@]} bundles to ${HARBOR_URL}; this takes 30-90 minutes:"
+    printf '%q ' "${shown[@]}" | sed -E 's/ --/ \\\n      --/g; s/^/      /' >&2
+    echo >&2
+    "${push[@]}" >&2 || die "nkp push bundle failed. Rerun: ${SCRIPT_PATH} --harbor"
+    ok "Bundles pushed to ${HARBOR_URL}"
+  fi
+  (
+    umask 077
+    echo "# Images for workload clusters of ${mgmt}, written $(date -Is). No secrets."
+    for k in HARBOR_URL HARBOR_CACERT HARBOR_EXTERNAL HARBOR_USER PUSH_UID PUSH_BUNDLES PUSH_DATE; do
+      printf '%s=%q\n' "$k" "${!k}"
+    done
+  ) >"$marker"
+  chmod 600 "$marker"
+}
+
+phase_harbor() { # --harbor: deploy Harbor and push the bundle for the management cluster this script created
+  step "Harbor"
+  command -v nkp >/dev/null || die "nkp CLI not found. Run the setup first."
+  ensure_docker_access
+  ensure_tmux_session
+  BUNDLE_FILES=""
+  load_mgmt_context
+  harbor_step "$MGMT_CLUSTER_NAME" "$MGMT_KCFG" || exit 1
+  write_lab_summary || true
+  info "Workload clusters now pull from ${HARBOR_URL}: ${SCRIPT_PATH} --workload"
+}
+
+q_mgmt_registry() { # workload cluster: pull its images from the Harbor the bundle was pushed to
+  REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
+  local marker def=${USE_MGMT_REGISTRY:-Y} proj robot user="" pass=""
+  marker=$(harbor_marker "$MGMT_CLUSTER_NAME")
   step "Images"
   if [[ $(nkp create cluster nutanix --help 2>&1 || true) != *--registry-mirror-url* ]]; then
     warn "This nkp CLI has no --registry-mirror-url option; ${CLUSTER_NAME} pulls from the internet."
-    USE_MGMT_REGISTRY=N NCR_URL=""
+    USE_MGMT_REGISTRY=N
     return 0
   fi
-  if [[ $MGMT_USE_BUNDLE != Y ]]; then
-    info "${MGMT_CLUSTER_NAME} was not seeded from the bundle, so its internal registry may not hold the NKP images."
+  if [[ ! -f $marker && $def != N ]]; then
+    info "No bundle has been pushed to a registry for ${MGMT_CLUSTER_NAME} yet (${marker})."
+    if [[ $MGMT_USE_BUNDLE == Y || -n ${REGISTRY_MIRROR_URL:-} ]] \
+       && ask_yn "Run the Harbor step now (deploy Harbor on ${MGMT_CLUSTER_NAME} if needed, push the bundle)?" Y; then
+      harbor_step "$MGMT_CLUSTER_NAME" "$MGMT_KCFG" || true
+    fi
   fi
-  if ! ask_yn "Pull ${CLUSTER_NAME}'s images from ${MGMT_CLUSTER_NAME}'s internal registry (${NCR_URL}) instead of Docker Hub?" "$def"; then
-    USE_MGMT_REGISTRY=N NCR_URL=""
+  if [[ ! -f $marker ]]; then
+    info "${CLUSTER_NAME} pulls its images from the internet. To change that: ${SCRIPT_PATH} --harbor"
+    USE_MGMT_REGISTRY=N
+    return 0
+  fi
+  [[ $def == N ]] || def=Y
+  HARBOR_URL=$(harbor_marker_get "$MGMT_CLUSTER_NAME" HARBOR_URL)
+  if ! ask_yn "Pull ${CLUSTER_NAME}'s images from ${HARBOR_URL} instead of the internet?" "$def"; then
+    USE_MGMT_REGISTRY=N
     return 0
   fi
   USE_MGMT_REGISTRY=Y
-  ca=$("${MGMT_K[@]}" -n kommander get kommanderclusters -l kommander.d2iq.io/host=true \
-    -o jsonpath='{.items[0].status.ingress.caBundle}' 2>/dev/null || true)
-  if [[ -z $ca ]]; then
-    ca=$("${MGMT_K[@]}" -n kommander get nkpclusters -l kommander.d2iq.io/host=true \
-      -o jsonpath='{.items[0].kommanderCluster.status.ingress.caBundle}' 2>/dev/null || true)
+  if [[ $(harbor_marker_get "$MGMT_CLUSTER_NAME" HARBOR_EXTERNAL) == Y && -z ${REGISTRY_MIRROR_URL:-} ]]; then
+    REGISTRY_MIRROR_URL=$HARBOR_URL REGISTRY_MIRROR_USERNAME=${REGISTRY_MIRROR_USERNAME:-$(harbor_marker_get "$MGMT_CLUSTER_NAME" HARBOR_USER)}
+    REGISTRY_MIRROR_CACERT=${REGISTRY_MIRROR_CACERT:-$(harbor_marker_get "$MGMT_CLUSTER_NAME" HARBOR_CACERT)}
   fi
-  [[ -n $ca ]] || die "Cannot read the ingress CA of ${MGMT_CLUSTER_NAME} (kommandercluster status). Try: ${SCRIPT_PATH} --status"
-  NCR_CACERT="${CLUSTER_DIR}/ncr-ca.pem"
-  (umask 077 && base64 -d <<<"$ca" >"$NCR_CACERT") 2>/dev/null || die "The ingress CA of ${MGMT_CLUSTER_NAME} is not valid base64."
-  chmod 600 "$NCR_CACERT"
-  grep -q 'BEGIN CERTIFICATE' "$NCR_CACERT" || die "The ingress CA of ${MGMT_CLUSTER_NAME} is not a PEM certificate."
-  if curl -sS -o /dev/null --max-time 15 --cacert "$NCR_CACERT" "${NCR_URL}/v2/" 2>/dev/null; then
-    ok "${NCR_URL} answers and its certificate matches the CA (${NCR_CACERT})"
+  harbor_login "$MGMT_CLUSTER_NAME" "$MGMT_KCFG"
+  NCR_URL=$HARBOR_URL NCR_CACERT=$HARBOR_CACERT
+  if hpy ping 2>/dev/null; then
+    ok "${HARBOR_URL} answers${HARBOR_CACERT:+ and its certificate matches ${HARBOR_CACERT}}"
   else
-    warn "${NCR_URL} does not answer from this host with that CA; the nodes may still reach it."
+    warn "${HARBOR_URL} does not answer from this host; the nodes may still reach it."
   fi
-
-  NCR_ADMIN_PASSWORD=$("${MGMT_K[@]}" -n ncr-system get secret harbor-admin-password \
-    -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
-  [[ -n $NCR_ADMIN_PASSWORD ]] || die "Cannot read the Harbor admin password from ${MGMT_CLUSTER_NAME} (ncr-system/harbor-admin-password)."
-  if projects=$(harbor_api GET '/projects?page_size=100' 2>/dev/null) \
-     && jq -e 'length > 0 and all(.[]; .metadata.public == "true")' <<<"$projects" >/dev/null 2>&1; then
+  proj=$(harbor_project "$HARBOR_URL")
+  if [[ -n $proj ]] && hpy public "$proj" 2>/dev/null; then
     NCR_AUTH=anonymous
-    ok "Every project in the internal registry is public; ${CLUSTER_NAME} pulls without credentials."
-  elif [[ -n ${projects:-} ]] && robot=$(ncr_robot "nkp-${CLUSTER_NAME#nkp-}"); then
-    read -r user pass <<<"$robot"
+    ok "Project ${proj} is public; ${CLUSTER_NAME} pulls without credentials."
+  elif [[ -n $proj ]] && robot=$(hpy robot "nkp-${CLUSTER_NAME#nkp-}" --project "$proj" \
+         --description "Pull-only access for NKP workload cluster ${CLUSTER_NAME}" 2>/dev/null); then
+    IFS=$'\t' read -r user pass <<<"$robot"
     NCR_AUTH="robot ${user}"
-    ok "Created pull-only robot account ${user} for ${CLUSTER_NAME}"
+    ok "Created pull-only robot account ${user} on project ${proj} for ${CLUSTER_NAME}"
   else
-    warn "The Harbor API at ${NCR_URL} did not answer as expected; a robot account could not be created."
-    if ! ask_yn "Let ${CLUSTER_NAME} pull with the Harbor admin account instead?" Y; then
+    warn "Could not create a robot account in ${HARBOR_URL}."
+    if ! ask_yn "Let ${CLUSTER_NAME} pull as ${HARBOR_USER} instead?" Y; then
       USE_MGMT_REGISTRY=N NCR_URL=""
       info "${CLUSTER_NAME} pulls its images from the internet."
       return 0
     fi
-    user=admin pass=$NCR_ADMIN_PASSWORD NCR_AUTH=admin
+    user=$HARBOR_USER pass=$HARBOR_PASSWORD NCR_AUTH=$HARBOR_USER
   fi
-  REGISTRY_MIRROR_ARGS=(--registry-mirror-url="$NCR_URL" --registry-mirror-cacert="$NCR_CACERT")
+  REGISTRY_MIRROR_ARGS=(--registry-mirror-url="$NCR_URL")
+  if [[ -n $NCR_CACERT ]]; then REGISTRY_MIRROR_ARGS+=(--registry-mirror-cacert="$NCR_CACERT"); fi
   if [[ $NCR_AUTH != anonymous ]]; then
     REGISTRY_MIRROR_ARGS+=(--registry-mirror-username="$user" --registry-mirror-password="$pass")
   fi
@@ -2189,11 +2019,10 @@ q_mgmt_registry() { # workload cluster: pull images through the management clust
 q_workspace() {
   step "Workspace"
   info "NKP attaches the workload cluster to this workspace on ${MGMT_CLUSTER_NAME}."
-  local vals=() labels=() name ns ws="" i
+  local vals=() labels=() name ns ws=""
   while IFS=$'\t' read -r name ns; do
     if [[ -n $ns ]]; then vals+=("$ns"); labels+=("${name}  (namespace ${ns})"); fi
-  done < <("${MGMT_K[@]}" get workspaces.workspaces.kommander.mesosphere.io -o json 2>/dev/null \
-    | jq -r '.items[] | [.metadata.name, (.spec.namespaceName // .status.namespaceRef.name // "")] | @tsv' || true)
+  done < <(py k8s workspaces --kubeconfig "$MGMT_KCFG" 2>/dev/null || true)
   WORKSPACE_NAMESPACE=${WORKSPACE_NAMESPACE:-kommander-default-workspace}
   local known=0
   for ns in "${vals[@]}"; do
@@ -2209,21 +2038,8 @@ q_workspace() {
   fi
   if [[ $WORKSPACE_NAMESPACE == new ]]; then
     [[ -n $ws ]] || ask ws "New workspace name (also its namespace)" v_dns_label
-    "${MGMT_K[@]}" apply -f - >/dev/null <<EOF || die "Could not create workspace ${ws}."
-apiVersion: workspaces.kommander.mesosphere.io/v1alpha1
-kind: Workspace
-metadata:
-  name: ${ws}
-  annotations:
-    kommander.mesosphere.io/display-name: ${ws}
-spec:
-  namespaceName: ${ws}
-EOF
+    py k8s workspace-create "$ws" --kubeconfig "$MGMT_KCFG" >/dev/null || die "Could not create workspace ${ws}."
     WORKSPACE_NAMESPACE=$ws
-    for ((i = 0; i < 30; i++)); do
-      if "${MGMT_K[@]}" get namespace "$ws" >/dev/null 2>&1; then break; fi
-      sleep 2
-    done
     ok "Workspace ${ws} created"
   fi
   "${MGMT_K[@]}" get namespace "$WORKSPACE_NAMESPACE" >/dev/null 2>&1 \
@@ -2287,7 +2103,7 @@ phase_workload() {
   ensure_docker_access
   ensure_tmux_session
   PC_API_OK=0 TLS_MODE="" TRUST_ARGS=() NUTANIX_REGISTRY_ARGS=() NODE_CIDR="" NODE_POOLS=""
-  BUNDLE_ARGS=() REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
+  BUNDLE_ARGS=() BUNDLE_FILES="" REGISTRY_MIRROR_ARGS=() NCR_URL="" NCR_AUTH=""
   load_mgmt_context
   CLUSTER_NAME="" CONTROLPLANE_IP="" SERVICE_LB_IP_RANGE=""
   ANSWERS_FILE="${WORKDIR}/nkp-workload.env"
@@ -2327,31 +2143,26 @@ phase_workload() {
 # ---------------------------------------------------------------------------
 
 restore_subnet() {
-  local f subnet_json pools dhcp body
+  local f pools dhcp now
   f=$(ip_plan_file)
   if [[ ! -f $f ]]; then info "No IP plan in ${WORKDIR}; the subnet was not changed by this script."; return 0; fi
   SUBNET_UUID=$(ip_plan_get IP_PLAN_SUBNET_UUID)
   pools=$(ip_plan_get IP_PLAN_ORIGINAL_POOLS)
   dhcp=$(ip_plan_get IP_PLAN_ORIGINAL_DHCP)
-  [[ -n $(ip_plan_get IP_PLAN_DNS) ]] || dhcp=keep
+  if [[ -z $(ip_plan_get IP_PLAN_DNS) ]]; then dhcp="keep"
+  elif [[ -z $dhcp || $dhcp == null ]]; then dhcp="unset"
+  else dhcp="set:${dhcp}"; fi
   step "Restoring subnet $(ip_plan_get IP_PLAN_SUBNET)"
-  subnet_json=$(pc_api GET "/api/nutanix/v3/subnets/${SUBNET_UUID}" 2>/dev/null) \
-    || die "Cannot read subnet ${SUBNET_UUID} from Prism Central; ${f} is kept so you can rerun --destroy."
-  body=$(jq -c --argjson pools "${pools:-[]}" --arg dhcp "$dhcp" '
-      {api_version: (.api_version // "3.1"), metadata: .metadata,
-       spec: (.spec | .resources.ip_config.pool_list = $pools
-              | if $dhcp == "keep" then .
-                elif $dhcp == "null" then del(.resources.ip_config.dhcp_options)
-                else .resources.ip_config.dhcp_options = ($dhcp | fromjson) end)}' <<<"$subnet_json")
-  subnet_update "$body" || die "Restoring the subnet failed; ${f} is kept so you can rerun --destroy."
-  ok "IPAM pool restored to $(jq -r '[.[].range | gsub(" +"; "-")] | join(",")' <<<"${pools:-[]}")"
+  now=$(py pc subnet-set "$SUBNET_UUID" --pools-json "${pools:-[]}" --dhcp "$dhcp") \
+    || die "Restoring the subnet failed; ${f} is kept so you can rerun --destroy."
+  ok "IPAM pool restored to ${now:-empty}"
 }
 
 pc_login_from_answers() { # TLS settings and password for Prism Central API calls outside the setup flow
   case ${TLS_MODE:-insecure} in
-    trusted) PC_TLS_ARGS=() ;;
-    cafile)  PC_TLS_ARGS=(--cacert "${CLUSTER_DIR}/prism-central-ca.pem") ;;
-    *)       PC_TLS_ARGS=(-k) ;;
+    trusted) PC_TLS=trusted ;;
+    cafile)  PC_TLS="${CLUSTER_DIR}/prism-central-ca.pem" ;;
+    *)       PC_TLS=insecure ;;
   esac
   PC_HOST=${NUTANIX_ENDPOINT#*://} PC_HOST=${PC_HOST%:*}
   local i code
@@ -2367,7 +2178,7 @@ pc_login_from_answers() { # TLS settings and password for Prism Central API call
 
 phase_destroy() {
   step "Destroy the NKP lab"
-  local f="${WORKDIR}/nkp-install.env" kcfg json ns name mgmt_ns boot confirm archive reachable=0
+  local f="${WORKDIR}/nkp-install.env" kcfg list ns name mgmt_ns=default boot confirm archive reachable=0
   [[ -f $f ]] || die "No answers at ${f}: nothing created by this script is known here (use --workdir)."
   # shellcheck disable=SC1090
   . "$f"
@@ -2385,18 +2196,18 @@ phase_destroy() {
   export NUTANIX_USER NUTANIX_PASSWORD
   ensure_docker_access
 
-  if [[ -f $kcfg ]] && json=$(kubectl --kubeconfig "$kcfg" get clusters.cluster.x-k8s.io -A -o json 2>/dev/null); then
+  if [[ -f $kcfg ]] && list=$(py k8s clusters --kubeconfig "$kcfg" 2>/dev/null); then
     reachable=1
   fi
   if ((reachable)); then
-    while read -r ns name; do
+    while IFS=$'\t' read -r -u 3 ns name; do
+      if [[ $name == "$CLUSTER_NAME" ]]; then mgmt_ns=$ns; fi
       [[ -n $name && $name != "$CLUSTER_NAME" ]] || continue
       step "Deleting workload cluster ${name} (namespace ${ns})"
       nkp delete cluster -c "$name" -n "$ns" --kubeconfig="$kcfg" >&2 || warn "nkp delete cluster ${name} reported an error."
       kubectl --kubeconfig "$kcfg" -n "$ns" wait --for=delete "clusters.cluster.x-k8s.io/${name}" --timeout=30m >&2 \
         || die "${name} is still being deleted. Rerun --destroy once it is gone."
-    done < <(jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name)"' <<<"$json")
-    mgmt_ns=$(jq -r --arg n "$CLUSTER_NAME" '[.items[] | select(.metadata.name == $n) | .metadata.namespace][0] // "default"' <<<"$json")
+    done 3<<<"$list"
 
     step "Deleting management cluster ${CLUSTER_NAME}"
     if [[ $(nkp delete cluster --help 2>&1 || true) == *--self-managed* ]]; then
@@ -2421,18 +2232,20 @@ phase_destroy() {
   restore_subnet
   archive="${WORKDIR}/archive-$(date +%Y%m%d-%H%M%S)"
   mkdir -m 700 "$archive"
-  for f in nkp-ip-plan.env nkp-install.env nkp-workload.env lab-summary.txt; do
+  for f in nkp-ip-plan.env nkp-install.env nkp-workload.env lab-summary.txt "${CLUSTER_NAME}/harbor-push.env"; do
     if [[ -f ${WORKDIR}/${f} ]]; then mv "${WORKDIR}/${f}" "$archive/"; fi
   done
-  ok "Answers and IP plan moved to ${archive}"
+  ok "Answers, IP plan and Harbor push record moved to ${archive}"
 }
 
 main() {
   parse_args "$@"
   if ((INIT_CONFIG)); then init_config; return 0; fi
+  [[ -r $PY_HELPER ]] || die "Missing ${PY_HELPER}: keep nkp_lab.py next to this script."
   if ((STATUS_ONLY)); then phase_status; return 0; fi
   if ((DESTROY)); then phase_destroy; return 0; fi
   if ((WORKLOAD)); then phase_workload; return 0; fi
+  if ((HARBOR_ONLY)); then phase_harbor; return 0; fi
   if ((DO_PREREQS)); then phase_prereqs; fi
   if ((!DO_SETUP)); then return 0; fi
   if ((LAB)); then phase_lab; else phase_setup; fi
