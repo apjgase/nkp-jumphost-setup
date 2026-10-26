@@ -46,6 +46,7 @@ class Fake:
         self.robots = [{"id": 7, "name": "robot$nkp-wl1"}]
         self.deleted = []
         self.created_robot = None
+        self.fail_tasks = 0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,6 +100,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(202, {"status": {"execution_context": {"task_uuid": "t1"}}})
             return self.send(200, f.subnet)
         if p == "/api/nutanix/v3/tasks/t1":
+            if f.fail_tasks:
+                f.fail_tasks -= 1
+                return self.send(200, {"status": "FAILED", "error_detail": "IP 10.0.0.170 is in use"})
             return self.send(200, {"status": "SUCCEEDED"})
         if p == "/api/nutanix/v3/vms/list":
             b = self.body()
@@ -235,6 +239,19 @@ class PrismCentral(ServerTest):
         run("pc", "subnet-set", "sub-1", "--pools-json", orig, "--dhcp", 'set:{"domain_name_server_list":["8.8.8.8"]}')
         self.assertEqual(self.fake.puts[-1]["spec"]["resources"]["ip_config"]["dhcp_options"],
                          {"domain_name_server_list": ["8.8.8.8"]})
+
+    def test_subnet_set_retries_failed_task(self):
+        os.environ["NKP_RETRY_SLEEP"] = "0"
+        self.fake.fail_tasks = 1
+        orig = json.dumps([{"range": "10.0.0.100 10.0.0.200"}])
+        rc, out, err = run("pc", "subnet-set", "sub-1", "--pools-json", orig, "--dhcp", "keep")
+        self.assertEqual((rc, out.strip()), (0, "10.0.0.100-10.0.0.200"))
+        self.assertIn("FAILED: IP 10.0.0.170 is in use Retrying", err)
+        self.fake.fail_tasks = 3
+        rc, _, err = run("pc", "subnet-set", "sub-1", "--pools-json", orig, "--dhcp", "keep")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(err.count("Retrying"), 2)
+        self.assertIn("FAILED: IP 10.0.0.170 is in use", err.splitlines()[-1])
 
     def test_capacity(self):
         c = kv(run("pc", "capacity", "pe-1", "default")[1])

@@ -358,28 +358,45 @@ def subnet_body(subnet, pools=None, dhcp="keep"):
     return {"api_version": subnet.get("api_version") or "3.1", "metadata": subnet.get("metadata"), "spec": spec}
 
 
+class TaskFailed(Fail):
+    pass
+
+
 def wait_task(client, task, sleep=2, tries=90):
     for _ in range(tries):
         try:
-            status = (client.api("GET", f"/api/nutanix/v3/tasks/{task}") or {}).get("status")
+            out = client.api("GET", f"/api/nutanix/v3/tasks/{task}") or {}
         except Fail:
-            status = None
+            out = {}
+        status = out.get("status")
         if status == "SUCCEEDED":
             return
         if status in ("FAILED", "ABORTED"):
-            raise Fail(f"Subnet update task {task} {status}.")
+            why = out.get("error_detail") or "; ".join(m.get("message", "") for m in out.get("message_list") or []
+                                                       if isinstance(m, dict))
+            raise TaskFailed(f"Subnet update task {task} {status}" + (f": {why}" if why else "."))
         time.sleep(sleep)
     raise Fail(f"Subnet update task {task} did not finish within {sleep * tries // 60} minutes.")
 
 
-def subnet_set(client, uuid, pools, dhcp):
-    subnet = client.api("GET", f"/api/nutanix/v3/subnets/{uuid}")
-    status, out = client.request("PUT", f"/api/nutanix/v3/subnets/{uuid}", subnet_body(subnet, pools, dhcp))
-    if not 200 <= status < 300:
-        raise Fail(f"Prism Central rejected the subnet update (HTTP {status}): {error_text(out)}")
-    task = ((out or {}).get("status") or {}).get("execution_context", {}).get("task_uuid") if isinstance(out, dict) else None
-    if task:
-        wait_task(client, task)
+def subnet_set(client, uuid, pools, dhcp, attempts=3):
+    """Prism Central can fail the task while it is still releasing the addresses of just-deleted VMs; retry then."""
+    pause = float(os.environ.get("NKP_RETRY_SLEEP", "30"))
+    for attempt in range(1, attempts + 1):
+        subnet = client.api("GET", f"/api/nutanix/v3/subnets/{uuid}")
+        status, out = client.request("PUT", f"/api/nutanix/v3/subnets/{uuid}", subnet_body(subnet, pools, dhcp))
+        if not 200 <= status < 300:
+            raise Fail(f"Prism Central rejected the subnet update (HTTP {status}): {error_text(out)}")
+        task = ((out or {}).get("status") or {}).get("execution_context", {}).get("task_uuid") if isinstance(out, dict) else None
+        try:
+            if task:
+                wait_task(client, task)
+            break
+        except TaskFailed as e:
+            if attempt == attempts:
+                raise
+            say(f"    ! {e} Retrying in {pause:g} s ({attempt}/{attempts - 1}).")
+            time.sleep(pause)
     return pool_ranges(client.api("GET", f"/api/nutanix/v3/subnets/{uuid}").get("spec", {}).get("resources", {}).get("ip_config"))
 
 
