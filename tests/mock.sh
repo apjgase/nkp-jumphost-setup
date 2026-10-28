@@ -43,6 +43,15 @@ echo "== unattended prompts"
   check "default container fallback" eq "$C" default-container-123
 )
 
+echo "== no terminal: no tmux relaunch"
+(
+  setup; UNATTENDED=1; unset TMUX STY NKP_LAB_CHILD
+  tmux() { echo "tmux $*" >>"$T/tmux.calls"; }
+  ( ensure_tmux_session </dev/null >/dev/null 2>&1; echo reached >"$T/tmux.reached" )
+  check "continues in place without a terminal" eq "$(cat "$T/tmux.reached" 2>/dev/null)" reached
+  check "tmux not started" eq "$(grep -c new-session "$T/tmux.calls" 2>/dev/null || true)" ""
+)
+
 echo "== --init-config and --config"
 (
   setup; cd "$T" && rm -f nkp-lab.env

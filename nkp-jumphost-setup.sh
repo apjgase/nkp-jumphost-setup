@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NKP 2.19 lab builder for a Linux jump host (Nutanix AHV, non-air-gapped).
+# NKP 2.19 lab builder for a Linux jump host (Nutanix AHV), from the dark site bundle or the internet.
 #
 # Phase 1 installs prerequisites: cgroups v2 check, base tools including tmux, Docker 27.4.0,
 #         kubectl 1.36.x, and the nkp CLI from the package you downloaded from the Nutanix Portal.
@@ -693,6 +693,10 @@ TMUX_SESSION=nkp
 ensure_tmux_session() {
   if [[ -n ${NKP_LAB_CHILD:-} ]]; then return 0; fi
   if [[ -n ${TMUX:-} || -n ${STY:-} ]]; then ok "Running inside tmux/screen"; return; fi
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    info "No terminal (non-interactive run): continuing here; keep it alive with nohup or a detached tmux session."
+    return 0
+  fi
   warn "Not inside tmux or screen. Cluster creation takes 30-60 minutes and stops if this SSH session drops."
   if ! command -v tmux >/dev/null; then
     ask_yn "tmux is not installed. Continue without it?" N \
