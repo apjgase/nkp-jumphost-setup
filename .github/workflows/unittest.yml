@@ -9,15 +9,20 @@ permissions:
   contents: read
 
 jobs:
-  unittest:
+  rocky9:
+    name: unittest (Rocky Linux 9, system Python 3.9)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.9", "3.13"]
+    container: rockylinux/rockylinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 --version && python3 -m unittest -v test_nkp_lab
+
+  current:
+    name: unittest (Python 3.13)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.13"
       - run: python3 -m unittest -v test_nkp_lab

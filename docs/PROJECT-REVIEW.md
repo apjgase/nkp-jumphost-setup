@@ -43,7 +43,7 @@ The owner's requirements, in their own words, were: deploy NKP from the dark sit
 | `tests/lib.sh` | Shared test setup: repo paths, scratch directory, a fresh TLS certificate per run, portable `sed`/`stat` |
 | `docs/` | This review and the deployment-agent instructions |
 | `README.md`, `LICENSE` | User quickstart, modes, secrets and lab assumptions; MIT license |
-| `.github/workflows/unittest.yml` | CI: `python3 -m unittest test_nkp_lab` on Python 3.9 and 3.13, on every push to `main` and every pull request |
+| `.github/workflows/unittest.yml` | CI: `python3 -m unittest test_nkp_lab` in a Rocky Linux 9 container (its system Python 3.9, as on the jump hosts) and on Python 3.13, on every push to `main` and every pull request |
 
 Users get the code with:
 
