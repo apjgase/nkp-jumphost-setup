@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""kubectl stub: `get ... -o json` serves $KSTATE/<args joined by _>.json; apply records objects and
+simulates the Harbor app coming up; every call is logged to $KSTATE/calls."""
+import base64
+import json
+import os
+import sys
+
+d = os.environ["KSTATE"]
+args = sys.argv[1:]
+if args[:1] == ["--kubeconfig"]:
+    args = args[2:]
+with open(os.path.join(d, "calls"), "a") as f:
+    f.write(" ".join(args) + "\n")
+
+
+def put(key, obj):
+    with open(os.path.join(d, key.replace("/", "%") + ".json"), "w") as f:
+        json.dump(obj, f)
+
+
+if args[:1] == ["apply"]:
+    obj = json.load(sys.stdin)
+    with open(os.path.join(d, "applied"), "a") as f:
+        f.write(json.dumps(obj) + "\n")
+    kind, name, ns = obj["kind"], obj["metadata"]["name"], obj["metadata"].get("namespace", "")
+    if kind == "ObjectBucketClaim":
+        put(f"-n_{ns}_get_secret_{name}", {"data": {"AWS_ACCESS_KEY_ID": base64.b64encode(b"AK").decode(),
+                                                   "AWS_SECRET_ACCESS_KEY": base64.b64encode(b"SK").decode()}})
+    if kind == "AppDeployment" and name == "harbor":
+        put("-n_ncr-system_get_secret_harbor-admin-password",
+            {"data": {"HARBOR_ADMIN_PASSWORD": base64.b64encode(b"secret").decode()}})
+        put("get_-n_ncr-system_helmreleases.helm.toolkit.fluxcd.io",
+            {"items": [{"metadata": {"name": "harbor"}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]})
+    sys.exit(0)
+
+if args[-2:] == ["-o", "json"]:
+    key = "_".join(args[:-2])
+    path = os.path.join(d, key.replace("/", "%") + ".json")
+    if os.path.exists(path):
+        sys.stdout.write(open(path).read())
+        sys.exit(0)
+    sys.stderr.write(f"Error from server (NotFound): {key}\n")
+    sys.exit(1)
+if args[:2] == ["get", "namespace"]:
+    sys.exit(0)
+sys.exit(0)
