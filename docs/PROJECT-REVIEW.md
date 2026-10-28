@@ -42,6 +42,8 @@ The owner's requirements, in their own words, were: deploy NKP from the dark sit
 | `tests/fake/` | The fake server (`fakeserver.py`, reusing the handler in `test_nkp_lab.py`) and stubs for `kubectl` and `ping` |
 | `tests/lib.sh` | Shared test setup: repo paths, scratch directory, a fresh TLS certificate per run, portable `sed`/`stat` |
 | `docs/` | This review and the deployment-agent instructions |
+| `README.md`, `LICENSE` | User quickstart, modes, secrets and lab assumptions; MIT license |
+| `.github/workflows/unittest.yml` | CI: `python3 -m unittest test_nkp_lab` on Python 3.9 and 3.13, on every push to `main` and every pull request |
 
 Users get the code with:
 
@@ -180,6 +182,8 @@ In the order they were made. "Owner" means the decision was the owner's call; th
 What the tests cannot prove: anything about real NKP, Harbor, Rook Ceph or Prism Central behaviour beyond what the fakes encode. The fake server's responses were written from the API documentation and the real-lab output above.
 
 `--check` is the bridge: it runs the read-only parts against the real lab.
+
+GitHub Actions runs only the `nkp_lab.py` unit tests; run `tests/run-all.sh` yourself before committing shell changes.
 
 ## 8. Open issues and unverified assumptions
 
