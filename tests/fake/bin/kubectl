@@ -27,11 +27,22 @@ if args[:1] == ["apply"]:
     if kind == "ObjectBucketClaim":
         put(f"-n_{ns}_get_secret_{name}", {"data": {"AWS_ACCESS_KEY_ID": base64.b64encode(b"AK").decode(),
                                                    "AWS_SECRET_ACCESS_KEY": base64.b64encode(b"SK").decode()}})
+    # harbor_deploy waits for Rook object-store + PrometheusRule CRDs before claiming the bucket / enabling Harbor.
+    if kind == "AppDeployment" and name in ("rook-ceph", "rook-ceph-cluster"):
+        put("get_storageclass_dkp-object-store", {"metadata": {"name": "dkp-object-store"}})
+        put("get_crd_objectbucketclaims.objectbucket.io",
+            {"metadata": {"name": "objectbucketclaims.objectbucket.io"}})
+    if kind == "AppDeployment" and name == "kube-prometheus-stack":
+        put("get_crd_prometheusrules.monitoring.coreos.com",
+            {"metadata": {"name": "prometheusrules.monitoring.coreos.com"}})
     if kind == "AppDeployment" and name == "harbor":
         put("-n_ncr-system_get_secret_harbor-admin-password",
             {"data": {"HARBOR_ADMIN_PASSWORD": base64.b64encode(b"secret").decode()}})
-        put("get_-n_ncr-system_helmreleases.helm.toolkit.fluxcd.io",
-            {"items": [{"metadata": {"name": "harbor"}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]})
+        # Flux creates Harbor HelmReleases in kommander (release namespace ncr-system).
+        harbor_hr = {"metadata": {"name": "harbor"},
+                     "status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+        put(f"get_-n_{ns or 'kommander'}_helmreleases.helm.toolkit.fluxcd.io", {"items": [harbor_hr]})
+        put("get_-n_ncr-system_helmreleases.helm.toolkit.fluxcd.io", {"items": [harbor_hr]})
     sys.exit(0)
 
 if args[-2:] == ["-o", "json"]:

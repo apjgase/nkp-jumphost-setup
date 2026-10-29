@@ -135,13 +135,13 @@ echo "== Harbor absent: deploy as in the guide"
 (
   setup 0
   ncr_cluster N
-  kput "get_clusterapps.apps.kommander.d2iq.io" '{"items":[{"metadata":{"name":"cloudnative-pg-1.25.1"}},{"metadata":{"name":"harbor-2.13.0"}},{"metadata":{"name":"harbor-2.14.1"}},{"metadata":{"name":"rook-ceph-cluster-1.17.0"}}]}'
+  kput "get_clusterapps.apps.kommander.d2iq.io" '{"items":[{"metadata":{"name":"cloudnative-pg-1.25.1"}},{"metadata":{"name":"harbor-2.13.0"}},{"metadata":{"name":"harbor-2.14.1"}},{"metadata":{"name":"rook-ceph-1.17.0"}},{"metadata":{"name":"rook-ceph-cluster-1.17.0"}}]}'
   kput "-n_kommander_get_appdeployments.apps.kommander.d2iq.io_rook-ceph-cluster" '{"spec":{"appRef":{"name":"rook-ceph-cluster-1.17.0","kind":"ClusterApp"}}}'
   BUNDLE_FILES="/b/konvoy-image-bundle-v2.19.0.tar"
   harbor_step nkp-mgmt "$MGMT_KCFG" 2>"$WORKDIR/err"; rc=$?
   check "rc 0" eq "$rc" 0
   applied=$(python3 -c 'import json,sys; print(" ".join(o["kind"]+"/"+o["metadata"]["name"] for o in map(json.loads, open(sys.argv[1]))))' "$KSTATE/applied")
-  check "objects in order" eq "$applied" "AppDeployment/cloudnative-pg ConfigMap/rook-ceph-cluster-overrides AppDeployment/rook-ceph-cluster ObjectBucketClaim/harbor-registry Secret/harbor-s3-credentials ConfigMap/harbor-overrides AppDeployment/harbor"
+  check "objects in order" eq "$applied" "AppDeployment/cloudnative-pg AppDeployment/rook-ceph ConfigMap/rook-ceph-cluster-overrides AppDeployment/rook-ceph-cluster ObjectBucketClaim/harbor-registry Secret/harbor-s3-credentials ConfigMap/harbor-overrides AppDeployment/harbor"
   check "newest harbor ClusterApp" has "$KSTATE/applied" '"appRef": {"name": "harbor-2.14.1"'
   check "ceph count 8" has "$KSTATE/applied" '\"count\": 8'
   check "pushed after deploy" eq "$(grep -c 'push bundle' "$WORKDIR/nkp.calls")" 1
@@ -151,13 +151,14 @@ echo "== Harbor absent with HARBOR_OVERRIDES_FILE"
 (
   setup 0
   ncr_cluster N
-  kput "get_clusterapps.apps.kommander.d2iq.io" '{"items":[{"metadata":{"name":"cloudnative-pg-1.25.1"}},{"metadata":{"name":"harbor-2.14.1"}}]}'
+  kput "get_clusterapps.apps.kommander.d2iq.io" '{"items":[{"metadata":{"name":"cloudnative-pg-1.25.1"}},{"metadata":{"name":"harbor-2.14.1"}},{"metadata":{"name":"rook-ceph-1.17.0"}},{"metadata":{"name":"rook-ceph-cluster-1.17.0"}}]}'
   printf 'persistence:\n  imageChartStorage:\n    type: s3\n' >"$WORKDIR/values.yaml"
   HARBOR_OVERRIDES_FILE="$WORKDIR/values.yaml" BUNDLE_FILES="/b/konvoy-image-bundle-v2.19.0.tar"
   harbor_step nkp-mgmt "$MGMT_KCFG" 2>"$WORKDIR/err"
   check "no bucket claim" hasnt "$KSTATE/applied" ObjectBucketClaim
   check "values from the file" has "$KSTATE/applied" 'persistence:\n  imageChartStorage:'
-  check "warned: no rook-ceph-cluster" has "$WORKDIR/err" "rook-ceph-cluster is not enabled"
+  check "enabled rook operator" has "$WORKDIR/err" "Enabled rook-ceph-1.17.0"
+  check "enabled rook cluster" has "$WORKDIR/err" "Enabled rook-ceph-cluster-1.17.0"
 )
 
 echo "== Workload registry: robot on the project"

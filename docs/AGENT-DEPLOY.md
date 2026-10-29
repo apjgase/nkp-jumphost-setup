@@ -113,6 +113,8 @@ Show the user, from the check output: the address block that will be reserved an
 printf '%s\n' '<PC PASSWORD>' | ssh "$H" 'IFS= read -r NUTANIX_PASSWORD; export NUTANIX_PASSWORD; mkdir -p ~/nkp && cd ~/nkp-jumphost-setup-main && nohup ./nkp-jumphost-setup.sh --lab --skip-prereqs --unattended --config nkp-lab.env >~/nkp/agent-lab.log 2>&1 </dev/null & echo started'
 ```
 
+On **Windows PowerShell**, do not pipe the password with `|` (it may send UTF-16 and Prism Central returns 401). Start `ssh` with redirected stdin and write the password as UTF-8 bytes, or run the same `printf | ssh` pattern from Git Bash / WSL.
+
 For the management cluster only, use `--skip-prereqs --unattended --config nkp-lab.env` without `--lab`.
 
 Monitor every 5 to 10 minutes, not continuously:
@@ -136,11 +138,16 @@ The script's last lines usually name the situation and the next commands. Common
 
 | Log shows | Meaning | Next step |
 | --- | --- | --- |
-| `Waiting for cluster control-planes to be ready` timed out; "objects are still on the local bootstrap cluster" | The management cluster never became reachable | Run the inspection commands the script printed (`nkp describe cluster ... --kubeconfig ~/.kube/config`, `kubectl ... get kubeadmcontrolplane,machines,nutanixmachines`, the `capx-system` logs). Report them. This is an open issue; the cluster may still recover by itself, so look again after 10 to 15 minutes before suggesting `--destroy` |
-| `timed out waiting for KommanderInitialized`, or "no platform applications" | Kommander did not install, usually undersized nodes | Report node sizes (`kubectl top nodes` with the cluster kubeconfig). Fix is usually destroy and redeploy with Pro sizing: ask |
+| `Waiting for cluster control-planes to be ready` timed out; "objects are still on the local bootstrap cluster" | The management cluster never became reachable | Run the inspection commands the script printed (`nkp describe cluster ... --kubeconfig ~/.kube/config`, `kubectl ... get kubeadmcontrolplane,machines,nutanixmachines`, the `capx-system` logs). Report them. Look again after 10 to 15 minutes before suggesting `--destroy` (DHCP join can self-heal) |
+| `Creating GitClaim` failed / GitClaim Ready=False / pre-receive declined | Often missing OCI `mesosphere/kommander-applications-full` in the in-cluster registry (seed only has `kommander-applications`) | Current script mirrors applications → applications-full during create. On an older script: copy that path in the registry PVC/pod, delete/recreate the `kommander` GitClaim, then continue (do not recreate the whole management cluster if VMs are healthy). Report if it still fails |
+| `timed out waiting for KommanderInitialized`, or "no platform applications" | Kommander did not install, often undersized nodes or GitClaim/OCI still broken | Check GitClaim and `kubectl -n kommander get helmrelease`. Undersized nodes: destroy and redeploy with `SIZING=pro` after asking |
 | HelmReleases not ready after the remediation | Some platform apps stuck | Report `--status`; apps often recover; check again later |
+| Harbor: rook-ceph-cluster not enabled / ObjectBucketClaim CRD missing | Rook not deployed yet | Current `harbor_deploy` enables Rook and waits for `dkp-object-store`. On an older script: enable `rook-ceph` + `rook-ceph-cluster` AppDeployments, wait for the StorageClass, then rerun `--harbor` |
+| Harbor: `PrometheusRule` / `monitoring.coreos.com` missing | Harbor database chart needs monitoring CRDs | Current script enables `kube-prometheus-stack` first. On an older script: enable that AppDeployment, wait for the CRD, annotate/reconcile `harbor-database`, then rerun `--harbor` if needed |
 | Harbor or push step failed, management cluster fine | | Report; rerunning `--harbor --skip-prereqs --unattended` (with the password, under nohup) is safe and needs no approval. It skips a running Harbor, and under `--unattended` it also skips the push when the project already holds images; if a push was cut short, tell the user, who can rerun `--harbor` interactively and answer yes to push again |
+| Workload “not Ready” / kubeconfig missing but VMs Running | Wrong namespace (`kommander-default-workspace` vs `nkp-workload1-<suffix>`), or waiting on CAPI `Ready` (use `Available` / `Provisioned`) | `kubectl get nkpclusters -A`; `nkp get kubeconfig -c <name> -n <that-ns>`. Current script resolves the namespace and waits for Available. Do not recreate the workload if NKPCluster is Reconciled |
 | Workload cluster failed | | Report `--status`; do not create it again; ask |
+| Prism Central `401` right after piping the password from Windows PowerShell | Password sent as UTF-16 | Pass UTF-8 bytes into SSH stdin (see section 8); do not use PowerShell's default pipeline encoding |
 
 To tear down, after the user approves:
 

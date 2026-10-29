@@ -21,7 +21,7 @@ kput "get_-n_kommander-default-workspace_helmreleases.helm.toolkit.fluxcd.io" "$
 kput "get_-n_kommander_kommanderclusters_-l_kommander.d2iq.io/host=true" \
   "{\"items\":[{\"status\":{\"ingress\":{\"address\":\"127.0.0.1\",\"caBundle\":\"$(base64 <"$T2/cert.pem" | tr -d '\n')\"}}}]}"
 kput "get_namespace_kube-system" '{"metadata":{"uid":"uid-1"}}'
-kput "get_clusterapps.apps.kommander.d2iq.io" '{"items":[{"metadata":{"name":"cloudnative-pg-1.25.1"}},{"metadata":{"name":"harbor-2.14.1"}},{"metadata":{"name":"rook-ceph-cluster-1.17.0"}}]}'
+kput "get_clusterapps.apps.kommander.d2iq.io" '{"items":[{"metadata":{"name":"cloudnative-pg-1.25.1"}},{"metadata":{"name":"harbor-2.14.1"}},{"metadata":{"name":"rook-ceph-1.17.0"}},{"metadata":{"name":"rook-ceph-cluster-1.17.0"}},{"metadata":{"name":"kube-prometheus-stack-69.0.0"}}]}'
 kput "-n_kommander_get_appdeployments.apps.kommander.d2iq.io_rook-ceph-cluster" '{"spec":{"appRef":{"name":"rook-ceph-cluster-1.17.0","kind":"ClusterApp"}}}'
 
 mkdir -p "$HOME/.ssh" && echo "ssh-ed25519 AAAA test" >"$HOME/.ssh/id_ed25519.pub"

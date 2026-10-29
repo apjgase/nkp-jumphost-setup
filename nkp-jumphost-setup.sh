@@ -1467,6 +1467,33 @@ run_preflight() {
   fi
 }
 
+# Background: once kubeconfig exists, copy mesosphere/kommander-applications → …-full in the
+# in-cluster registry so GitClaim's immutable OCI URL can resolve during create.
+mirror_kommander_applications_full_bg() {
+  local kcfg=$1 log="${CLUSTER_DIR}/mirror-applications-full.log"
+  (
+    local i pod
+    for i in $(seq 1 180); do
+      [[ -f $kcfg ]] || { sleep 10; continue; }
+      pod=$(kubectl --kubeconfig "$kcfg" -n registry-system get pods --no-headers 2>/dev/null \
+              | awk '/registry/{print $1; exit}') || true
+      [[ -n $pod ]] || { sleep 10; continue; }
+      if kubectl --kubeconfig "$kcfg" -n registry-system exec "$pod" -c docker-registry -- sh -c '
+           BASE=/var/lib/registry/docker/registry/v2/repositories/mesosphere
+           [ -d "$BASE/kommander-applications" ] || exit 3
+           if [ -d "$BASE/kommander-applications-full" ]; then echo already; exit 0; fi
+           cp -a "$BASE/kommander-applications" "$BASE/kommander-applications-full"
+           echo copied
+         ' >>"$log" 2>&1; then
+        exit 0
+      fi
+      sleep 10
+    done
+    echo "timeout waiting to mirror kommander-applications-full" >>"$log"
+  ) >/dev/null 2>&1 &
+  info "Mirroring kommander-applications → applications-full in the background (log: ${log})."
+}
+
 run_create() {
   if ((PRINT_ONLY)); then
     info "--print-only: not creating the cluster. Command saved to ${CLUSTER_DIR}/create-cluster.cmd"
@@ -1481,6 +1508,11 @@ run_create() {
     info "Moved the kubeconfig of an earlier ${CLUSTER_NAME} aside (${CLUSTER_NAME}.conf.old-*)."
   fi
   step "Creating ${CLUSTER_NAME} (log: ${LOG})"
+  # Air-gap: GitClaim wants mesosphere/kommander-applications-full, but some bundle seeds only
+  # push kommander-applications. Mirror it as soon as the in-cluster registry has the source tag.
+  if ((!WORKLOAD)) && ((${#BUNDLE_ARGS[@]})); then
+    mirror_kommander_applications_full_bg "${CLUSTER_DIR}/${CLUSTER_NAME}.conf"
+  fi
   if ! (cd "$CLUSTER_DIR" && "${CMD[@]}") 2>&1 | tee -a "$LOG"; then
     err "Cluster creation failed. Full log: ${LOG}"
     if ((WORKLOAD)); then
@@ -2102,44 +2134,73 @@ q_workspace() {
     || die "Namespace ${WORKSPACE_NAMESPACE} does not exist on ${MGMT_CLUSTER_NAME}."
 }
 
+# NKP 2.19 may place the CAPI/NKPCluster objects in a dedicated namespace (e.g. <name>-xxxxx)
+# even when create was invoked with --namespace=<workspace>. Prefer that over WORKSPACE_NAMESPACE.
+resolve_workload_ns() {
+  local ns
+  ns=$("${MGMT_K[@]}" get nkpclusters -A --no-headers 2>/dev/null \
+        | awk -v c="$CLUSTER_NAME" '$2 == c { print $1; exit }') || true
+  if [[ -z $ns ]]; then
+    ns=$("${MGMT_K[@]}" get clusters.cluster.x-k8s.io -A --no-headers 2>/dev/null \
+          | awk -v c="$CLUSTER_NAME" '$2 == c { print $1; exit }') || true
+  fi
+  printf '%s\n' "${ns:-$WORKSPACE_NAMESPACE}"
+}
+
 post_workload() {
-  local kcfg="${CLUSTER_DIR}/${CLUSTER_NAME}.conf" i out joined=0
-  local describe=(nkp describe cluster -c "$CLUSTER_NAME" -n "$WORKSPACE_NAMESPACE" --kubeconfig="$MGMT_KCFG")
+  local kcfg="${CLUSTER_DIR}/${CLUSTER_NAME}.conf" i out joined=0 wl_ns
+  wl_ns=$(resolve_workload_ns)
+  local describe=(nkp describe cluster -c "$CLUSTER_NAME" -n "$wl_ns" --kubeconfig="$MGMT_KCFG")
   step "Waiting for ${CLUSTER_NAME}"
   info "${MGMT_CLUSTER_NAME} provisions the VMs; this usually takes 15-30 minutes. Progress: ${describe[*]}"
-  if "${MGMT_K[@]}" -n "$WORKSPACE_NAMESPACE" wait --for=condition=Ready "clusters.cluster.x-k8s.io/${CLUSTER_NAME}" --timeout=60m; then
-    ok "${CLUSTER_NAME} is Ready"
-  else
-    warn "${CLUSTER_NAME} is not Ready after 60 minutes."
-    "${describe[@]}" >&2 || true
-  fi
-  if (umask 077 && nkp get kubeconfig -c "$CLUSTER_NAME" -n "$WORKSPACE_NAMESPACE" --kubeconfig="$MGMT_KCFG" >"$kcfg"); then
+  info "Watching cluster objects in namespace ${wl_ns}"
+  # CAPI Cluster v1 exposes Available (not Ready). Also accept phase=Provisioned.
+  for ((i = 0; i < 360; i++)); do
+    wl_ns=$(resolve_workload_ns)
+    if "${MGMT_K[@]}" -n "$wl_ns" get "clusters.cluster.x-k8s.io/${CLUSTER_NAME}" >/dev/null 2>&1; then
+      if "${MGMT_K[@]}" -n "$wl_ns" wait --for=condition=Available "clusters.cluster.x-k8s.io/${CLUSTER_NAME}" --timeout=15s >/dev/null 2>&1 \
+         || [[ $("${MGMT_K[@]}" -n "$wl_ns" get "clusters.cluster.x-k8s.io/${CLUSTER_NAME}" -o jsonpath='{.status.phase}' 2>/dev/null) == Provisioned ]]; then
+        ok "${CLUSTER_NAME} is Available/Provisioned (namespace ${wl_ns})"
+        break
+      fi
+    fi
+    if ((i == 359)); then
+      warn "${CLUSTER_NAME} is not Available after 60 minutes."
+      describe=(nkp describe cluster -c "$CLUSTER_NAME" -n "$wl_ns" --kubeconfig="$MGMT_KCFG")
+      "${describe[@]}" >&2 || true
+    fi
+    sleep 10
+  done
+  wl_ns=$(resolve_workload_ns)
+  if (umask 077 && nkp get kubeconfig -c "$CLUSTER_NAME" -n "$wl_ns" --kubeconfig="$MGMT_KCFG" >"$kcfg"); then
     ok "Kubeconfig: ${kcfg}"
   else
     rm -f "$kcfg"
-    warn "Could not fetch the kubeconfig yet. Later: nkp get kubeconfig -c ${CLUSTER_NAME} -n ${WORKSPACE_NAMESPACE} --kubeconfig=${MGMT_KCFG} > ${kcfg}"
+    warn "Could not fetch the kubeconfig yet. Later: nkp get kubeconfig -c ${CLUSTER_NAME} -n ${wl_ns} --kubeconfig=${MGMT_KCFG} > ${kcfg}"
     return
   fi
   kubectl --kubeconfig "$kcfg" get nodes -o wide >&2 || true
 
-  info "Waiting for ${CLUSTER_NAME} to join workspace ${WORKSPACE_NAMESPACE} (up to 20 minutes)..."
+  info "Waiting for ${CLUSTER_NAME} NKPCluster to reconcile (up to 20 minutes)..."
   for ((i = 0; i < 120; i++)); do
-    out=$("${MGMT_K[@]}" -n "$WORKSPACE_NAMESPACE" get nkpclusters "$CLUSTER_NAME" --no-headers 2>/dev/null || true)
-    if [[ $out == *Joined* ]]; then joined=1; break; fi
+    wl_ns=$(resolve_workload_ns)
+    out=$("${MGMT_K[@]}" -n "$wl_ns" get nkpclusters "$CLUSTER_NAME" --no-headers 2>/dev/null || true)
+    if [[ $out == *Joined* || $out == *Reconciled* ]]; then joined=1; break; fi
     sleep 10
   done
-  if ((joined)); then ok "${CLUSTER_NAME} joined ${WORKSPACE_NAMESPACE}"
+  if ((joined)); then ok "${CLUSTER_NAME} NKPCluster Ready in ${wl_ns}: ${out}"
   else warn "${CLUSTER_NAME} has not joined yet. Check: kubectl --kubeconfig ${MGMT_KCFG} get nkpclusters -A"; fi
 
   info "Waiting for the platform applications on ${CLUSTER_NAME} (up to 30 minutes)..."
-  if wait_helmreleases "$kcfg" "$WORKSPACE_NAMESPACE" 30; then
+  # Workload platform HelmReleases live in the cluster's workspace namespace, not kommander.
+  if wait_helmreleases "$kcfg" "$wl_ns" 30; then
     ok "All platform applications are ready"
   else
     warn "Platform applications not ready after 30 minutes:"
-    helmreleases_not_ready "$kcfg" "$WORKSPACE_NAMESPACE" | sed 's/^/      /' >&2 || true
-    if ! remediate_apps "$kcfg" "$CLUSTER_NAME" "$WORKSPACE_NAMESPACE" "$MGMT_KCFG"; then
+    helmreleases_not_ready "$kcfg" "$wl_ns" | sed 's/^/      /' >&2 || true
+    if ! remediate_apps "$kcfg" "$CLUSTER_NAME" "$wl_ns" "$MGMT_KCFG"; then
       warn "Some applications are still not ready."
-      info "Add workers: nkp scale nodepools md-0 --replicas=<n> -c ${CLUSTER_NAME} -n ${WORKSPACE_NAMESPACE} --kubeconfig=${MGMT_KCFG}"
+      info "Add workers: nkp scale nodepools md-0 --replicas=<n> -c ${CLUSTER_NAME} -n ${wl_ns} --kubeconfig=${MGMT_KCFG}"
     fi
   fi
   cat >&2 <<EOF
@@ -2148,7 +2209,7 @@ post_workload() {
       export KUBECONFIG=${kcfg}
       kubectl get nodes
       NKP dashboard (on ${MGMT_CLUSTER_NAME}): workspace ${WORKSPACE_NAMESPACE} > Clusters > ${CLUSTER_NAME}
-      Node pools: nkp get nodepools -c ${CLUSTER_NAME} -n ${WORKSPACE_NAMESPACE} --kubeconfig=${MGMT_KCFG}
+      Node pools: nkp get nodepools -c ${CLUSTER_NAME} -n ${wl_ns} --kubeconfig=${MGMT_KCFG}
       Another workload cluster: ${SCRIPT_PATH} --workload
 EOF
 }

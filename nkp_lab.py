@@ -699,16 +699,41 @@ def harbor_s3_values(bucket, endpoint):
 
 def harbor_deploy(k, ns, overrides_file, ceph_count, wait_min):
     """CloudNativePG, more Rook Ceph capacity, an object bucket and Harbor, as in 'Deploying Harbor on a Management Cluster'."""
-    apps = {n: cluster_app(k, n) for n in ("cloudnative-pg", "rook-ceph-cluster", "harbor")}
-    for n in ("cloudnative-pg", "harbor"):
+    apps = {n: cluster_app(k, n) for n in (
+        "cloudnative-pg", "rook-ceph", "rook-ceph-cluster", "kube-prometheus-stack", "harbor")}
+    for n in ("cloudnative-pg", "rook-ceph", "rook-ceph-cluster", "harbor"):
         if not apps[n]:
             raise Fail(f"No ClusterApp {n}-<version> on this cluster.")
     k.apply(appdeployment("cloudnative-pg", ns, apps["cloudnative-pg"]))
     say(f"    Enabled {apps['cloudnative-pg']}")
 
+    # Harbor's CNPG chart creates PrometheusRule objects; enable kube-prometheus-stack for the CRDs.
+    if apps.get("kube-prometheus-stack") and not k.json(
+            "-n", ns, "get", "appdeployments.apps.kommander.d2iq.io", "kube-prometheus-stack", check=False):
+        k.apply(appdeployment("kube-prometheus-stack", ns, apps["kube-prometheus-stack"]))
+        say(f"    Enabled {apps['kube-prometheus-stack']}")
+    if apps.get("kube-prometheus-stack"):
+        for _ in range(90):
+            if k.json("get", "crd", "prometheusrules.monitoring.coreos.com", check=False):
+                break
+            time.sleep(10)
+        else:
+            raise Fail("PrometheusRule CRD not ready (enable kube-prometheus-stack before Harbor).")
+
+    # Operator first; Harbor S3 needs rook-ceph-cluster (ObjectBucketClaim CRDs / dkp-object-store).
+    if not k.json("-n", ns, "get", "appdeployments.apps.kommander.d2iq.io", "rook-ceph", check=False):
+        k.apply(appdeployment("rook-ceph", ns, apps["rook-ceph"]))
+        say(f"    Enabled {apps['rook-ceph']}")
+
     rook = k.json("-n", ns, "get", "appdeployments.apps.kommander.d2iq.io", "rook-ceph-cluster", check=False)
     if not rook:
-        say("    ! rook-ceph-cluster is not enabled on this cluster; Harbor needs it for its S3 storage.")
+        if ceph_count:
+            k.apply(configmap("rook-ceph-cluster-overrides", ns, ceph_override(ceph_count)))
+            k.apply(appdeployment("rook-ceph-cluster", ns, apps["rook-ceph-cluster"], "rook-ceph-cluster-overrides"))
+            say(f"    Enabled {apps['rook-ceph-cluster']}: {ceph_count} x 40 GiB volumes")
+        else:
+            k.apply(appdeployment("rook-ceph-cluster", ns, apps["rook-ceph-cluster"]))
+            say(f"    Enabled {apps['rook-ceph-cluster']}")
     elif (rook.get("spec") or {}).get("configOverrides"):
         say(f"    ! rook-ceph-cluster already has overrides ({rook['spec']['configOverrides'].get('name')}); not changing its capacity.")
     elif ceph_count:
@@ -720,17 +745,25 @@ def harbor_deploy(k, ns, overrides_file, ceph_count, wait_min):
         with open(overrides_file) as f:
             values = f.read()
     else:
+        for _ in range(90):
+            sc = k.json("get", "storageclass", "dkp-object-store", check=False)
+            crds = k.json("get", "crd", "objectbucketclaims.objectbucket.io", check=False)
+            if sc and crds:
+                break
+            time.sleep(10)
+        else:
+            raise Fail("Rook Ceph object store is not ready (missing StorageClass dkp-object-store or ObjectBucketClaim CRD).")
         k.apply({"apiVersion": "objectbucket.io/v1alpha1", "kind": "ObjectBucketClaim",
                  "metadata": {"name": HARBOR_BUCKET, "namespace": ns},
                  "spec": {"bucketName": HARBOR_BUCKET, "storageClassName": "dkp-object-store"}})
         secret = None
-        for _ in range(60):
+        for _ in range(90):
             secret = k.json("-n", ns, "get", "secret", HARBOR_BUCKET, check=False)
             if secret and (secret.get("data") or {}).get("AWS_ACCESS_KEY_ID"):
                 break
             time.sleep(10)
         else:
-            raise Fail(f"The object bucket {HARBOR_BUCKET} was not provisioned within 10 minutes (Rook Ceph object store dkp-object-store).")
+            raise Fail(f"The object bucket {HARBOR_BUCKET} was not provisioned within 15 minutes (Rook Ceph object store dkp-object-store).")
         d = secret["data"]
         k.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "harbor-s3-credentials", "namespace": ns},
                  "type": "Opaque", "data": {"REGISTRY_STORAGE_S3_ACCESSKEY": d["AWS_ACCESS_KEY_ID"],
@@ -741,12 +774,16 @@ def harbor_deploy(k, ns, overrides_file, ceph_count, wait_min):
     say(f"    Enabled {apps['harbor']}; waiting for it (up to {wait_min} minutes)...")
     deadline = time.time() + wait_min * 60
     while time.time() < deadline:
-        bad = hr_not_ready(k, "ncr-system")
-        if bad == [] and harbor_admin_password(k):
+        # Harbor HelmReleases are created in the kommander namespace (release ns is ncr-system).
+        bad = [t for t in (hr_not_ready(k, ns) or []) if t[0].startswith("harbor")]
+        harbor_hr = any(
+            h.get("metadata", {}).get("name") == "harbor"
+            for h in k.items("-n", ns, "helmreleases.helm.toolkit.fluxcd.io"))
+        if harbor_hr and bad == [] and harbor_admin_password(k):
             return apps["harbor"]
         time.sleep(15)
-    bad = hr_not_ready(k, "ncr-system") or []
-    raise Fail("Harbor is not ready: " + ("; ".join(f"{n}: {m}" for n, m in bad) or "no HelmRelease in ncr-system yet"))
+    bad = [t for t in (hr_not_ready(k, ns) or []) if t[0].startswith("harbor")]
+    raise Fail("Harbor is not ready: " + ("; ".join(f"{n}: {m}" for n, m in bad) or "harbor HelmRelease not Ready yet"))
 
 
 # ---------------------------------------------------------------------------

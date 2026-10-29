@@ -15,16 +15,18 @@ One script that takes a freshly provisioned Nutanix lab (Prism Central, one AHV 
 
 The owner's requirements, in their own words, were: deploy NKP from the dark site bundle as documented; deploy Harbor; push the images to Harbor; use that registry for all later clusters; and use shell only where required, doing the external API work (Prism Central, Kubernetes, Harbor) in Python.
 
-## 2. Status (2026-10-28)
+## 2. Status (2026-10-30)
 
 | Area | State |
 | --- | --- |
 | Jump host prerequisites | Works on a real lab (Rocky Linux 9) |
 | `--check` (read-only readiness test) | Works on a real lab |
 | IP plan, AutoAD DNS on the subnet | Works on a real lab |
-| Management cluster from the bundle | Reached a running cluster on a real lab once (Kommander then failed on undersized nodes; fixed by Pro sizing). The second run with Pro sizing failed earlier, at the control plane: **open issue**, section 8 |
-| Harbor deployment and `nkp push bundle` | Tested against mocks only; not yet run on a real cluster |
-| Workload cluster through Harbor | Tested against mocks only |
+| Management cluster from the bundle | Works on a real lab with Pro sizing (Kommander + GitClaim + platform apps) |
+| Harbor deployment and `nkp push bundle` | Works on a real lab (Rook Ceph + kube-prometheus-stack enabled first; full 447-image push) |
+| Workload cluster through Harbor | Works on a real lab (robot pull from Harbor; CAPI wait uses `Available` / `Provisioned`) |
+| End-to-end `--lab` (mgmt + Harbor + workload) | Two consecutive real-lab successes after the 10-29/10-30 fixes (destroy between rounds) |
+| LoadBalancer smoke test on workload | Verified: Deployment + `type: LoadBalancer` received an EXTERNAL-IP and answered HTTP |
 | `--destroy` and subnet restore | Works on a real lab (after the retry fix for a Prism Central timestamp conflict) |
 | Offline tests | `tests/run-all.sh`: all pass |
 
@@ -152,6 +154,11 @@ In the order they were made. "Owner" means the decision was the owner's call; th
 | 10-26 | `--destroy` deletes a cluster that never left the bootstrap cluster through `~/.kube/config`; kubeconfigs are archived, and moved aside before a new create | A failed second run left a stale kubeconfig, which made the error messages wrong |
 | 10-28 | Tests moved into the repo with one runner; fresh TLS certificate per run | They lived in `/tmp`, and the fixed test certificate had expired |
 | 10-28 | No tmux relaunch without a terminal | Agent runs over SSH have no terminal, and the relaunch needs one |
+| 10-30 | During management create, background-mirror `mesosphere/kommander-applications` → `kommander-applications-full` in the in-cluster registry | GitClaim's immutable OCI URL is `…/kommander-applications-full:v2.19.0`; some air-gap seeds only push the short name, so Kommander never past Creating GitClaim |
+| 10-30 | `harbor_deploy` enables `rook-ceph` + `rook-ceph-cluster` (OSD overrides) and waits for `dkp-object-store` / ObjectBucketClaim CRD before claiming the Harbor bucket | Previously only warned when Rook was missing, then failed creating `ObjectBucketClaim` |
+| 10-30 | `harbor_deploy` enables `kube-prometheus-stack` and waits for the `PrometheusRule` CRD before enabling Harbor | Harbor's CNPG chart installs PrometheusRules; without the CRD the `harbor-database` HelmRelease fails |
+| 10-30 | Harbor readiness waits on `kommander` HelmReleases whose names start with `harbor`, plus `ncr-system/harbor-admin-password` | Flux creates those HelmReleases in `kommander` (release namespace `ncr-system`); waiting only in `ncr-system` never saw Ready |
+| 10-30 | `post_workload` resolves the real CAPI/NKPCluster namespace via `kubectl get nkpclusters -A`, waits for `Available`/`Provisioned`, treats NKPCluster `Reconciled` as joined, and waits for HelmReleases in that workspace namespace | NKP 2.19 places the workload in `nkp-workload1-<suffix>`; CAPI Cluster v1 has no `Ready` condition; apps are not in `kommander` on the workload |
 
 ## 6. What the real-lab runs taught
 
@@ -164,6 +171,12 @@ In the order they were made. "Owner" means the decision was the owner's call; th
 | `--check`: `'Primary' not found`, real name `primary-<cluster>` | Template default too specific | Blank default with `primary(-...)` matching, and a suggestion |
 | `--check`: `nkp CLI catalog: v0.11.1` | Read the first line of `nkp version` | Read the `nkp:` line |
 | `Creating GitClaim for management GitRepository` then `timed out waiting for KommanderInitialized` | Starter sizing (2 vCPU / 8 GiB control plane, 4 vCPU / 8 GiB workers); probes timed out | Pro sizing default; honest status when no HelmReleases exist |
+| GitClaim Ready=False / pre-receive declined; OCI `kommander-applications-full` missing | Air-gap seed had `mesosphere/kommander-applications` but GitClaim wants `-full` | Copy/retag applications → applications-full in the in-cluster registry, then delete/recreate GitClaim |
+| Harbor deploy: `ObjectBucketClaim` / no Rook | `harbor_deploy` only warned when `rook-ceph-cluster` AppDeployment was absent | Enable `rook-ceph` + `rook-ceph-cluster` (with OSD overrides) and wait for `dkp-object-store` |
+| Harbor database HelmRelease fails on `PrometheusRule` CRD | Harbor CNPG chart needs monitoring CRDs | Enable `kube-prometheus-stack` before Harbor |
+| Harbor wait never finished though pods were Ready | Wait loop looked for HelmReleases in `ncr-system`; they live in `kommander` | Wait on kommander `harbor*` HelmReleases + `ncr-system/harbor-admin-password` |
+| Workload “not Ready after 60m” / kubeconfig missing though VMs Ready | CAPI/NKPCluster lived in `nkp-workload1-<suffix>`, not `kommander-default-workspace` | Resolve namespace via `kubectl get nkpclusters -A` and wait/fetch there |
+| Script hung on `kubectl wait --for=condition=Ready` for Cluster though VMs/NKPCluster were fine | CAPI Cluster v1 uses `Available` (and `phase=Provisioned`); there is no `Ready` condition | Wait for `condition=Available` or `phase=Provisioned`; treat NKPCluster `Reconciled` as success |
 | `--destroy`: `Logical timestamp mismatch: request=23 current=24` | Prism Central was still updating the subnet as the deleted VMs released their addresses | Re-read the subnet and retry |
 | `Waiting for cluster control-planes to be ready` timed out after 60 min; kubeconfig fails with `x509: certificate signed by unknown authority` | Not yet known (section 8). The x509 error came from the previous cluster's kubeconfig | Stale kubeconfig handling; diagnostics printed; root cause open |
 
@@ -187,13 +200,14 @@ GitHub Actions runs only the `nkp_lab.py` unit tests; run `tests/run-all.sh` you
 
 ## 8. Open issues and unverified assumptions
 
-1. **Control plane never became Ready (second real run, Pro sizing).** `nkp create cluster` stopped at "Waiting for cluster control-planes to be ready" after 60 minutes; the cluster objects were still on the bootstrap cluster. Not yet diagnosed. Next steps, from the NKP guide: `nkp describe cluster -c <name> -n kommander --kubeconfig ~/.kube/config`; `kubectl --kubeconfig ~/.kube/config -n kommander get kubeadmcontrolplane,machines,nutanixmachines -o wide`; the `capx-system` controller logs; whether the control plane address answers on 6443; and `cloud-init-output.log` and `journalctl -u kubelet` on a control-plane VM (`ssh nkpadmin@<vm>`: the script's `SSH_USERNAME`, not the docs' `konvoy`). Candidates: slow DHCP on a joining control-plane VM (known issue NCN-115035, often self-heals), an address conflict on the control plane endpoint, or nodes unable to pull from the bootstrap registry on the jump host (port 5000; less likely because the first run passed this stage).
-2. **Harbor S3 settings are a best guess.** `harbor_s3_values` in `nkp_lab.py` writes what the NKP UI is believed to write. Verify against a real 2.19 cluster with `kubectl -n kommander get appdeployment harbor -o yaml` and the ConfigMap it references; `HARBOR_OVERRIDES_FILE` replaces the built-in values meanwhile.
-3. **Harbor location and path** are assumptions from the guide: that `--bundle` clusters put Harbor in `ncr-system` on port 5000 of the ingress address, and that `nkp push bundle` accepts a `/nkp` project path.
-4. **Workload sizing default is still `WL_SIZING=starter`.** The management cluster lesson suggests Pro for workload clusters too when capacity allows; not changed yet.
+1. **Earlier “control plane never Ready on bootstrap” (pre–10-30).** Still useful if a create stalls before the management kubeconfig exists: inspect with `nkp describe cluster` / machines on the bootstrap kubeconfig, `capx-system` logs, and control-plane `cloud-init` / kubelet. Candidates remain slow DHCP (NCN-115035), endpoint IP conflict, or bootstrap registry reachability. Two Pro-sizing end-to-end runs on 10-30 completed past this stage.
+2. **Harbor S3 settings are still a best guess.** Real 2.19 labs accepted `harbor_s3_values` + Rook `dkp-object-store`, but compare against a UI-deployed Harbor ConfigMap when upgrading NKP; `HARBOR_OVERRIDES_FILE` replaces the built-in values.
+3. **`kommander-applications-full` may be missing from some air-gap seeds.** The script mirrors `kommander-applications` → `kommander-applications-full` in the in-cluster registry during create. If a future bundle ships a *different* digest under `-full`, prefer the real artifact over the copy.
+4. **Workload sizing default is still `WL_SIZING=starter`.** Management uses Pro; workload Pro is recommended when capacity allows but is not the default yet.
 5. **Every run without `--skip-prereqs` unpacks the package again** (tens of GiB). Skip when an unpacked copy of the same package exists.
-6. **`nkp get kubeconfig -n` is assumed** in one failure message; the docs only show `-c`.
+6. **`nkp get kubeconfig -c … -n …` is required** for workload clusters in a dedicated namespace (`nkp-workload1-<suffix>`). Omitting `-n` or using only `kommander-default-workspace` fails even when the cluster is healthy.
 7. `cluster-dryrun.yaml` contains credentials because nkp renders them into secrets; it is mode 600, but still on disk.
+8. **Windows agents / PowerShell:** piping a password into `ssh` with PowerShell's default encoding can send UTF-16 and cause Prism Central `401`. Write the password as UTF-8 bytes to the SSH process stdin (or run the remote `IFS= read -r NUTANIX_PASSWORD` pattern from a UTF-8-aware host).
 
 ## 9. Working on the script
 
